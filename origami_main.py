@@ -18,8 +18,8 @@ from collections import defaultdict
 from math import radians
 
 from .origami_state import HIGHLIGHT_FACES
+from .origami_state import DRAW_HANDLERS
 
-DRAW_HANDLERS = set()
 
 def undo_post_handler(dummy):
     for obj in bpy.data.objects:
@@ -75,6 +75,22 @@ def on_active_fold_changed(self, context):
     for area in context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
+
+def on_active_group_changed(self, context):
+    obj = context.object
+    if not obj:
+        return
+
+    g = obj.active_fold_group
+    obj.active_fold = 0
+
+    if g >= len(obj.fold_groups):
+        return
+
+    for group in obj.fold_groups:
+        if group != obj.fold_groups[g]:
+            for fold in group.folds:
+                fold.selected = False
 
 def print_rabbit(rabbit):
     print("---- Rabbit Ear ----")
@@ -201,9 +217,9 @@ def depsgraph_handler(scene, depsgraph):
             obj["_topo_edge_len"] = len(bm.edges)
             obj["_topo_face_len"] = len(bm.faces)
             rebuild_regions_from_seed_uv(obj, bm)
-            for group in obj.fold_groups:
-                for index, rabbit in enumerate(group.rabbit_ears):
-                    apply_rabbit_to_group(obj, bm, group, rabbit.fold_a_index, rabbit.fold_b_index, False, index)
+            # for group in obj.fold_groups:
+            #     for index, rabbit in enumerate(group.rabbit_ears):
+            #         apply_rabbit_to_group(obj, bm, group, rabbit.fold_a_index, rabbit.fold_b_index, False)
 
 def smart_bisect(bm, geom, plane_origin, plane_normal, merge_dist=0.0001, eps=1e-8):
 
@@ -459,6 +475,11 @@ class RabbitEar(PropertyGroup):
     region_b_base_faces: CollectionProperty(type=OrigamiFaceIndex)
     region_b_tip_faces: CollectionProperty(type=OrigamiFaceIndex)
 
+    selected: bpy.props.BoolProperty(
+        name="Selected",
+        default=False
+    )
+
 class OrigamiFoldGroup(PropertyGroup):
     name: bpy.props.StringProperty(default="Fold Group")
     folds: CollectionProperty(type=OrigamiFold)
@@ -501,6 +522,34 @@ class ORIGAMI_UL_folds(bpy.types.UIList):
 
         row.label(
             text=f"Fold {index} | Angle: {round((fold.angle / np.pi) * 180, 2)}",
+            icon='MOD_SIMPLEDEFORM'
+        )
+
+class ORIGAMI_UL_rabbit_ears(bpy.types.UIList):
+
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index
+    ):
+        rabbit_ear = item
+
+        row = layout.row(align=True)
+
+        row.prop(
+            rabbit_ear,
+            "selected",
+            text=""
+        )
+
+        row.label(
+            text=f"FoldA: {rabbit_ear.fold_a_index} | FoldB: {rabbit_ear.fold_b_index}",
             icon='MOD_SIMPLEDEFORM'
         )
 
@@ -846,7 +895,7 @@ def find_shared_edge_between_regions(bm, region_a, region_b):
     # usually there should only be one meaningful edge
     return candidate_edges[0]
 
-def apply_rabbit_to_group(obj, bm, group, fold_a_index, fold_b_index, cut=True, overwrite_index=-1):
+def apply_rabbit_to_group(obj, bm, group, fold_a_index, fold_b_index, cut=True):
     indices = (fold_a_index, fold_b_index)
 
     for i in range(len(group.rabbit_ears) - 1, -1, -1):
@@ -859,10 +908,7 @@ def apply_rabbit_to_group(obj, bm, group, fold_a_index, fold_b_index, cut=True, 
     data, center = build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
     if not data:
         return
-    if overwrite_index == -1:
-        rabbit = group.rabbit_ears.add()
-    else:
-        rabbit = group.rabbit_ears[overwrite_index]
+    rabbit = group.rabbit_ears.add()
 
     edge_a = find_shared_edge_between_regions(
         bm,
@@ -870,7 +916,7 @@ def apply_rabbit_to_group(obj, bm, group, fold_a_index, fold_b_index, cut=True, 
         data["tip_A"]
     )
 
-    edge_b = find_shared_edge_between_regions( #TODO FIX THIS NOT GOING THE RIGHT WAY
+    edge_b = find_shared_edge_between_regions(
         bm,
         data["base_B"],
         data["tip_B"]
@@ -1205,56 +1251,56 @@ def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
 
     working_faces = total_faces
 
+    overlap_faces = [bm.faces[i] for i in total_faces if i < len(bm.faces)]
+    candidate_faces = [
+        bm.faces[i]
+        for i in total_faces
+        if i < len(bm.faces)
+    ]
+    overlap_edges = set()
+    for f in overlap_faces:
+        overlap_edges.update(f.edges)
+    geom = list(overlap_faces) + list(overlap_edges)
+
+    threshold = 0.005 * obj.scale.length
+
+    pathA = build_crease_path(
+        bm,
+        candidate_faces,
+        origin,
+        reflected_normalA,
+        threshold
+    )
+
+    pathB = build_crease_path(
+        bm,
+        candidate_faces,
+        origin,
+        reflected_normalB,
+        threshold
+    )
+
+    pathMid = build_crease_path(
+        bm,
+        candidate_faces,
+        origin,
+        split_dir,
+        threshold
+    )
+
     if cut:
-        overlap_faces = [bm.faces[i] for i in total_faces if i < len(bm.faces)]
-        candidate_faces = [
-            bm.faces[i]
-            for i in total_faces
-            if i < len(bm.faces)
-        ]
-        overlap_edges = set()
-        for f in overlap_faces:
-            overlap_edges.update(f.edges)
-        geom = list(overlap_faces) + list(overlap_edges)
-
-        threshold = 0.005 * obj.scale.length
-
-        pathA = build_crease_path(
-            bm,
-            candidate_faces,
-            origin,
-            reflected_normalA,
-            threshold
-        )
-
-        pathB = build_crease_path(
-            bm,
-            candidate_faces,
-            origin,
-            reflected_normalB,
-            threshold
-        )
-
-        pathMid = build_crease_path(
-            bm,
-            candidate_faces,
-            origin,
-            split_dir,
-            threshold
-        )
-
         apply_crease_path(bm, pathA, threshold)
         apply_crease_path(bm, pathB, threshold)
         apply_crease_path(bm, pathMid, threshold)
 
-        bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
 
-        bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
-        ensure_full_lookup_table(bm)
-        rebuild_regions_from_seed_uv(obj, bm, group)
-        facesA = {f.index for f in foldA.region_faces}
-        facesB = {f.index for f in foldB.region_faces}
-        working_faces = facesA | facesB
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    ensure_full_lookup_table(bm)
+    rebuild_regions_from_seed_uv(obj, bm, group)
+    facesA = {f.index for f in foldA.region_faces}
+    facesB = {f.index for f in foldB.region_faces}
+    working_faces = facesA | facesB
 
     eps = 0.001 * obj.scale.length
     
@@ -1269,7 +1315,6 @@ def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
         c = bm.faces[f].calc_center_median()
         region = classify_face_for_rabbit(c, origin, reflected_normalA, split_dir, reflected_normalB, eps)
         regions[region].append(f)
-    print("END build rabbit ear")
     return regions, origin
 
 def rabbit_ear_eval(rabbit, foldA, foldB, t, bm):
@@ -1599,22 +1644,18 @@ class FoldEvaluator:
                 if not fold_mats:
                     continue
 
-                if len(fold_mats) == 1:
-                    print("ONE")
-                    chosen_mat = fold_mats[0][1]
-                    print(chosen_mat)
-                else:
-                    print("MORE")
-                    _, chosen_mat = fold_mats[-1]
+                T = Matrix.Identity(4)
 
-                face_xforms[f_idx] = chosen_mat @ face_xforms[f_idx]
+                for _, mat in fold_mats:
+                    T = mat @ T
+
+                face_xforms[f_idx] = T @ face_xforms[f_idx]
 
                 f = bm.faces[f_idx]
 
                 # assign ONE transform per vert for this group
                 for v in f.verts:
                     if v.index not in group_vert_xforms:
-                        print("ERROR")
                         group_vert_xforms[v.index] = face_xforms[f_idx]
 
             for v_idx, T in group_vert_xforms.items():
@@ -1648,7 +1689,6 @@ def draw_callback(_self):
 
     if not HIGHLIGHT_FACES and not preview:
         return
-        
     me = obj.data
     bm = bmesh.from_edit_mesh(me)
     ensure_full_lookup_table(bm)
@@ -1801,6 +1841,7 @@ class ORIGAMI_OT_pick_side(Operator):
             return {'RUNNING_MODAL'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
+            HIGHLIGHT_FACES.clear()
             self.finish(context)
             return {'CANCELLED'}
 
@@ -1810,7 +1851,7 @@ class ORIGAMI_OT_pick_side(Operator):
 
         if event.type == 'MOUSEMOVE' and not self.typing:
             delta = event.mouse_region_x - self.start_mouse_x
-            self.angle = delta * 0.01
+            self.angle = delta * 0.02
 
             if event.ctrl:
                 step = math.radians(15)
@@ -1845,6 +1886,14 @@ class ORIGAMI_OT_pick_side(Operator):
         )
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
+            self.angle = 0
+            self.preview_fold.angle = self.angle
+            FoldEvaluator.evaluate(
+                self.obj,
+                timeline,
+                self.preview_fold
+            )
+            HIGHLIGHT_FACES.clear()
             self.finish(context)
             return {'CANCELLED'}
 
@@ -2047,6 +2096,7 @@ class ORIGAMI_OT_drag_fold(Operator):
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             self.draw_preview, (context,), 'WINDOW', 'POST_VIEW'
         )
+        DRAW_HANDLERS.add(self._handle)
 
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
@@ -2065,15 +2115,12 @@ class ORIGAMI_OT_drag_fold(Operator):
             self.update_preview(context, event)
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-            print("TRYING")
             self.commit(context)
             return {'FINISHED'}
 
         return {'RUNNING_MODAL'}
 
     def raycast_point(self, context, event):
-        if event.type in {'SHIFT', 'LEFT_SHIFT', 'WHEELUPMOUSE'}: #TODO HANDLE SNAP TYPE PROPERlY
-            print(event.type)
         bm = bmesh.from_edit_mesh(self.me)
         ensure_full_lookup_table(bm)
         region = context.region
@@ -2134,11 +2181,9 @@ class ORIGAMI_OT_drag_fold(Operator):
         start_vert = bm.verts[self.start_vertex_index]
 
         if not start_vert:
-            print("NO NO NO NO START VERT AGHGHGH")
             return
 
         if not start_vert.link_faces:
-            print("No linked face")
             return
 
         seed_face = start_vert.link_faces[0]
@@ -2371,7 +2416,6 @@ class ORIGAMI_OT_drag_fold(Operator):
         return p_obj, "NONE"
 
     def commit(self, context):
-        print("ALMOST!")
         if not self.crease_path:
             print("NO VALID CREASE PATH")
             self.finish(context)
@@ -2390,7 +2434,6 @@ class ORIGAMI_OT_drag_fold(Operator):
         bmesh.update_edit_mesh(self.me, loop_triangles=True, destructive=True)
 
         HIGHLIGHT_FACES.clear()
-        print("COMMITTED!!!!!!!!!!!!!!!!!!!!!!!")
         self.finish(context)
 
     def compute_paper_normal(self, bm):
@@ -2452,7 +2495,7 @@ class ORIGAMI_OT_fold_back(bpy.types.Operator):
     def execute(self, context):
         obj = context.object
 
-        obj.fold_timeline = max(0.0, obj.fold_timeline - 1.0)
+        obj.fold_timeline = max(0.0, math.floor(obj.fold_timeline-0.0001))
 
         FoldEvaluator.evaluate(obj, obj.fold_timeline)
 
@@ -2465,10 +2508,7 @@ class ORIGAMI_OT_fold_forward(bpy.types.Operator):
     def execute(self, context):
         obj = context.object
 
-        obj.fold_timeline = min(
-            len(obj.fold_groups),
-            obj.fold_timeline + 1.0
-        )
+        obj.fold_timeline = min(len(obj.fold_groups), math.ceil(obj.fold_timeline + 0.0001))
 
         FoldEvaluator.evaluate(obj, obj.fold_timeline)
 
@@ -2499,22 +2539,22 @@ class ORIGAMI_PT_panel(Panel):
 
         layout.operator("origami.pick_side", text="Make New Fold")
         layout.operator("origami.drag_fold", text="Drag Corner Fold")
-        layout.operator("origami.remove_mask_layer", text="Fix Broken Stuff")
+        layout.operator("origami.fix_stuff", text="Fix Broken Stuff")
         layout.prop(obj, "base_axis", slider=True)
         layout.operator("origami.set_basis", text="Set New Base Axis Rotation")
 
-class ORIGAMI_OT_remove_mask_layer(bpy.types.Operator):
-    bl_idname = "origami.remove_mask_layer"
+class ORIGAMI_OT_fix_stuff(bpy.types.Operator):
+    bl_idname = "origami.fix_stuff"
     bl_label = "Remove Mask Layer"
     
     def execute(self, context):
         obj = context.object
         bm = bmesh.from_edit_mesh(obj.data)
         rebuild_regions_from_seed_uv(obj, bm)
+        HIGHLIGHT_FACES.clear()
+        # for group in obj.fold_groups:
 
-        for group in obj.fold_groups:
-
-            group.rabbit_ears.clear()
+        #     group.rabbit_ears.clear()
 
         return{'FINISHED'}
 
@@ -2534,11 +2574,29 @@ class ORIGAMI_OT_fold_delete(bpy.types.Operator):
             fold = group.folds[f]
             group.folds.remove(f)
             obj.active_fold = max(0, f - 1)
-        print(len(group.folds))
         if len(group.folds) == 0:
             groups.remove(g)
         if len(groups) > 0 and obj.active_fold_group == len(groups):
             obj.active_fold_group = obj.active_fold_group - 1
+        
+        return {'FINISHED'}
+
+class ORIGAMI_OT_rabbit_delete(bpy.types.Operator):
+    bl_idname = "origami.rabbit_delete"
+    bl_label = "Delete Rabbit Ear"
+
+    def execute(self, context):
+        obj = context.object
+        groups = obj.fold_groups
+        g = obj.active_fold_group
+        r = obj.active_rabbit
+
+        group = obj.fold_groups[g]
+
+        if r < len(group.rabbit_ears):
+            rabbit = group.folds[r]
+            group.rabbit_ears.remove(r)
+            obj.active_rabbit = max(0, r - 1)
         
         return {'FINISHED'}
 
@@ -2548,33 +2606,18 @@ class ORIGAMI_OT_fold_move_up(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.object
+
         g = obj.active_fold_group
         f = obj.active_fold
 
-        if g <= 0:
+        group = obj.fold_groups[g]
+
+        if f <= 0:
             return {'CANCELLED'}
 
-        src_group = obj.fold_groups[g]
-        dst_group = obj.fold_groups[g - 1]
+        group.folds.move(f, f - 1)
 
-        if f >= len(src_group.folds):
-            return {'CANCELLED'}
-
-        fold = src_group.folds[f]
-
-        new_fold = dst_group.folds.add()
-
-        for attr in ["pivot_3d", "axis", "angle", "mask_id"]:
-            setattr(new_fold, attr, getattr(fold, attr))
-
-        for rf in fold.region_faces:
-            item = new_fold.region_faces.add()
-            item.index = rf.index
-
-        src_group.folds.remove(f)
-
-        obj.active_fold_group = g - 1
-        obj.active_fold = len(dst_group.folds) - 1
+        obj.active_fold -= 1
 
         return {'FINISHED'}
 
@@ -2584,36 +2627,18 @@ class ORIGAMI_OT_fold_move_down(bpy.types.Operator):
 
     def execute(self, context):
         obj = context.object
+
         g = obj.active_fold_group
         f = obj.active_fold
 
-        if g >= len(obj.fold_groups) - 1:
+        group = obj.fold_groups[g]
+
+        if f >= len(group.folds) - 1:
             return {'CANCELLED'}
 
-        src_group = obj.fold_groups[g]
-        dst_group = obj.fold_groups[g + 1]
+        group.folds.move(f, f + 1)
 
-        if f >= len(src_group.folds):
-            return {'CANCELLED'}
-
-        fold = src_group.folds[f]
-
-        # --- copy ---
-        new_fold = dst_group.folds.add()
-
-        for attr in ["pivot_3d", "axis", "angle", "mask_id"]:
-            setattr(new_fold, attr, getattr(fold, attr))
-
-        for rf in fold.region_faces:
-            item = new_fold.region_faces.add()
-            item.index = rf.index
-
-        # --- remove ---
-        src_group.folds.remove(f)
-
-        # update selection
-        obj.active_fold_group = g + 1
-        obj.active_fold = len(dst_group.folds) - 1
+        obj.active_fold += 1
 
         return {'FINISHED'}
 
@@ -2712,7 +2737,7 @@ class ORIGAMI_PT_fold_history_panel(Panel):
             # --- FOLD LIST (for selected group) ---
             if obj.fold_groups and obj.active_fold_group < len(obj.fold_groups):
                 group = obj.fold_groups[obj.active_fold_group]
-                layout.prop(group, "name", text="", emboss=False)
+                layout.label(text="Folds")
                 row = layout.row()
                 row.template_list(
                     "ORIGAMI_UL_folds",
@@ -2728,6 +2753,23 @@ class ORIGAMI_PT_fold_history_panel(Panel):
                 col.operator("origami.fold_delete", icon='X', text="")
                 col.operator("origami.fold_move_up", icon='TRIA_UP', text="")
                 col.operator("origami.fold_move_down", icon='TRIA_DOWN', text="")
+
+            if obj.fold_groups and obj.active_fold_group < len(obj.fold_groups) and len(obj.fold_groups[obj.active_fold_group].rabbit_ears) > 0:
+                group = obj.fold_groups[obj.active_fold_group]
+                layout.label(text="Rabbit Ears")
+                row = layout.row()
+                row.template_list(
+                    "ORIGAMI_UL_rabbit_ears",
+                    "",
+                    group,
+                    "rabbit_ears",
+                    obj,
+                    "active_rabbit",
+                    rows=6
+                )
+
+                col = row.column(align=True)
+                col.operator("origami.rabbit_delete", icon='X', text="")
 
 # =========================================================
 # REGISTER
@@ -2745,10 +2787,12 @@ def register():
     bpy.utils.register_class(ORIGAMI_PT_panel)
     bpy.utils.register_class(ORIGAMI_PT_fold_history_panel)
 
-    bpy.utils.register_class(ORIGAMI_OT_remove_mask_layer)
+    bpy.utils.register_class(ORIGAMI_OT_fix_stuff)
     bpy.utils.register_class(ORIGAMI_UL_fold_groups)
     bpy.utils.register_class(ORIGAMI_UL_folds)
+    bpy.utils.register_class(ORIGAMI_UL_rabbit_ears)
     bpy.utils.register_class(ORIGAMI_OT_fold_delete)
+    bpy.utils.register_class(ORIGAMI_OT_rabbit_delete)
     bpy.utils.register_class(ORIGAMI_OT_fold_move_up)
     bpy.utils.register_class(ORIGAMI_OT_fold_move_down)
     bpy.utils.register_class(ORIGAMI_OT_group_move_up)
@@ -2776,10 +2820,13 @@ def register():
     bpy.types.Object.origami_paper_positions = CollectionProperty(
         type=bpy.types.PropertyGroup
     )
-    bpy.types.Object.active_fold_group = IntProperty()
+    bpy.types.Object.active_fold_group = IntProperty(
+        update=on_active_group_changed
+    )
     bpy.types.Object.active_fold = IntProperty(
         update=on_active_fold_changed
     )
+    bpy.types.Object.active_rabbit = IntProperty()
 
     if depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_handler)
@@ -2800,10 +2847,12 @@ def unregister():
     bpy.utils.unregister_class(OrigamiUVPoint)
     bpy.utils.unregister_class(ORIGAMI_PT_fold_history_panel)
 
-    bpy.utils.unregister_class(ORIGAMI_OT_remove_mask_layer)
+    bpy.utils.unregister_class(ORIGAMI_OT_fix_stuff)
     bpy.utils.unregister_class(ORIGAMI_UL_fold_groups)
     bpy.utils.unregister_class(ORIGAMI_UL_folds)
+    bpy.utils.register_class(ORIGAMI_UL_rabbit_ears)
     bpy.utils.unregister_class(ORIGAMI_OT_fold_delete)
+    bpy.utils.unregister_class(ORIGAMI_OT_rabbit_delete)
     bpy.utils.unregister_class(ORIGAMI_OT_fold_move_up)
     bpy.utils.unregister_class(ORIGAMI_OT_fold_move_down)
     bpy.utils.unregister_class(ORIGAMI_OT_group_move_up)
@@ -2827,6 +2876,7 @@ def unregister():
     del bpy.types.Object.origami_paper_positions
     del bpy.types.Object.active_fold_group
     del bpy.types.Object.active_fold
+    del bpy.types.Object.active_rabbit
 
     remove_draw_handlers()
     if depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
@@ -2835,12 +2885,14 @@ def unregister():
         bpy.app.handlers.undo_post.remove(undo_post_handler)
 
 def remove_draw_handlers():
+    print(len(DRAW_HANDLERS))
     for h in DRAW_HANDLERS:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
         except:
             pass
     DRAW_HANDLERS.clear()
+    print("Removed draw handlers")
 
 remove_draw_handlers()
 
