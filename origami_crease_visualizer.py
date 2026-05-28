@@ -3,9 +3,13 @@ import gpu
 from mathutils import Vector
 from gpu_extras.batch import batch_for_shader
 
+from .origami_state import DEBUG_UV_SEGMENTS
+from .origami_state import DEBUG_BLOCKED_EDGES
+from .origami_state import DEBUG_TESTED_EDGES
+
 # Store handler globally so we can remove it
 _crease_handle = None
-
+_uv_debug_handle = None
 
 # -----------------------------
 # Data Extraction
@@ -64,6 +68,106 @@ def clip_line_to_unit_square(pivot, direction):
 # -----------------------------
 # Drawing
 # -----------------------------
+def enable_uv_debug():
+
+    global _uv_debug_handle
+
+    if _uv_debug_handle is not None:
+        return
+
+    _uv_debug_handle = bpy.types.SpaceImageEditor.draw_handler_add(
+        draw_uv_debug,
+        (),
+        'WINDOW',
+        'POST_VIEW'
+    )
+
+def disable_uv_debug():
+
+    global _uv_debug_handle
+
+    if _uv_debug_handle is not None:
+
+        bpy.types.SpaceImageEditor.draw_handler_remove(
+            _uv_debug_handle,
+            'WINDOW'
+        )
+
+        _uv_debug_handle = None
+
+def draw_uv_debug():
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+
+    # -------------------------
+    # STORED CREASE SEGMENTS
+    # GREEN
+    # -------------------------
+
+    coords = []
+
+    for a, b in DEBUG_UV_SEGMENTS:
+        coords.extend([a, b])
+
+    if coords:
+
+        batch = batch_for_shader(
+            shader,
+            'LINES',
+            {"pos": coords}
+        )
+
+        shader.bind()
+        shader.uniform_float("color", (0, 1, 0, 1))
+
+        batch.draw(shader)
+
+    # -------------------------
+    # TESTED EDGES
+    # BLUE
+    # -------------------------
+
+    coords = []
+
+    for a, b in DEBUG_TESTED_EDGES:
+        coords.extend([a, b])
+
+    if coords:
+
+        batch = batch_for_shader(
+            shader,
+            'LINES',
+            {"pos": coords}
+        )
+
+        shader.bind()
+        shader.uniform_float("color", (0, 0, 1, 0.3))
+
+        batch.draw(shader)
+
+    # -------------------------
+    # BLOCKED EDGES
+    # RED
+    # -------------------------
+
+    coords = []
+
+    for a, b in DEBUG_BLOCKED_EDGES:
+        coords.extend([a, b])
+
+    if coords:
+
+        batch = batch_for_shader(
+            shader,
+            'LINES',
+            {"pos": coords}
+        )
+
+        shader.bind()
+        shader.uniform_float("color", (1, 0, 0, 1))
+
+        batch.draw(shader)
+
 
 def draw_crease_pattern():
     obj = bpy.context.object
