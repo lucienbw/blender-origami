@@ -6,6 +6,7 @@ from gpu_extras.batch import batch_for_shader
 from .origami_state import DEBUG_UV_SEGMENTS
 from .origami_state import DEBUG_BLOCKED_EDGES
 from .origami_state import DEBUG_TESTED_EDGES
+from .origami_state import DEBUG_CORNER_POINTS
 
 # Store handler globally so we can remove it
 _crease_handle = None
@@ -43,6 +44,38 @@ def get_crease_lines(obj):
 # -----------------------------
 # Geometry: Clip to UV bounds
 # -----------------------------
+
+def debug_corner_fold_uv(obj, bm, corner):
+    from .origami_state import DEBUG_CORNER_POINTS
+
+    DEBUG_CORNER_POINTS.clear()
+
+    uv_layer = bm.loops.layers.uv.active
+
+    regions = [
+        (corner.region_a_faces, (1, 1, 0, 1)),
+        (corner.region_b_faces, (0, 1, 1, 1)),
+        (corner.overlap_faces_a, (0, 1, 0, 1)),
+        (corner.overlap_faces_b, (1, 0, 1, 1)),
+    ]
+
+    for collection, color in regions:
+
+        for item in collection:
+            face = bm.faces[item.index]
+
+            uv_sum = Vector((0, 0))
+            count = 0
+
+            for loop in face.loops:
+                uv_sum += loop[uv_layer].uv
+                count += 1
+
+            uv_center = uv_sum / count
+
+            DEBUG_CORNER_POINTS.append(
+                (uv_center.copy(), color)
+            )
 
 def clip_line_to_unit_square(pivot, direction):
     """Clip infinite line to UV square [0,1]x[0,1]."""
@@ -165,6 +198,23 @@ def draw_uv_debug():
 
         shader.bind()
         shader.uniform_float("color", (1, 0, 0, 1))
+
+        batch.draw(shader)
+
+
+    # Corner
+    for pos, color in DEBUG_CORNER_POINTS:
+
+        batch = batch_for_shader(
+            shader,
+            'POINTS',
+            {"pos": [pos]}
+        )
+
+        gpu.state.point_size_set(8)
+
+        shader.bind()
+        shader.uniform_float("color", color)
 
         batch.draw(shader)
 
