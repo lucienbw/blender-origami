@@ -8,7 +8,7 @@ import bpy
 import numpy as np
 
 from bpy.types import PropertyGroup, Panel, Operator
-from bpy.props import FloatProperty, FloatVectorProperty, CollectionProperty, IntProperty, PointerProperty, BoolProperty
+from bpy.props import FloatProperty, FloatVectorProperty, CollectionProperty, IntProperty, PointerProperty, EnumProperty, BoolProperty
 from mathutils import Vector, Matrix
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
@@ -20,6 +20,7 @@ from math import radians
 from .origami_state import HIGHLIGHT_FACES
 from .origami_state import DRAW_HANDLERS
 from .origami_state import DEBUG_UV_SEGMENTS
+from .origami_state import INTERACTION_UV_SEGMENT_LISTS
 from .origami_state import DEBUG_BLOCKED_EDGES
 from .origami_state import DEBUG_TESTED_EDGES
 
@@ -28,7 +29,7 @@ from .origami_crease_visualizer import disable_uv_debug
 
 EPS = 1e-5
 
-
+DEBUG_FLOODS = []
 def update_timeline(self, context):
     obj = context.object
     if not obj:
@@ -36,12 +37,87 @@ def update_timeline(self, context):
 
     FoldEvaluator.evaluate(obj, obj.fold_timeline)
 
+def on_interaction_type_changed(self, context):
+    self.regions.clear()
+    groups = context.object.fold_groups
+    group = find_group_for_interaction(groups, self)
+    index = next((i for i, obj in enumerate(groups) if obj == group), None)
+    current_time = context.object.fold_timeline
+    FoldEvaluator.evaluate(context.object, index)
+    build_interaction_data_from_type(self, context)
+    FoldEvaluator.evaluate(context.object, current_time)
+
 class OrigamiFaceIndex(PropertyGroup):
     index: bpy.props.IntProperty()
 
 class OrigamiUVSegment(PropertyGroup):
     a: FloatVectorProperty(size=2)
     b: FloatVectorProperty(size=2)
+
+class OrigamiRegion(PropertyGroup):
+    region_name: bpy.props.StringProperty(
+        default="Base"
+    )
+
+    seed_uv: FloatVectorProperty(size=2)
+
+    crease_uv_segments: CollectionProperty(
+        type=OrigamiUVSegment
+    )
+
+    cached_topology_version: IntProperty(default=-1)
+
+    cached_faces: CollectionProperty(
+        type=OrigamiFaceIndex
+    )
+
+class OrigamiAxis(PropertyGroup):
+    value: FloatVectorProperty(size=3)
+
+class FoldInteraction(PropertyGroup):
+    owner_fold_index: IntProperty()
+    other_fold_index: IntProperty()
+
+    interaction_type: EnumProperty(
+        name="Interaction",
+        items=[
+            ("NONE", "None", ""),
+            ("CORNER_M", "Corner Mountain", ""),
+            ("CORNER_V", "Corner Valley", ""),
+            ("RABBIT", "Rabbit Ear", ""),
+            ("COLLAPSE", "Collapse", ""),
+            ("NESTED", "Nested", ""),
+        ],
+        default="NONE",
+        update=on_interaction_type_changed
+    )
+
+    regions: CollectionProperty(
+        type=OrigamiRegion
+    )
+
+    def get_region(self, name):
+        for region in self.regions:
+            if region.region_name == name:
+                return region
+        region = self.regions.add()
+        region.region_name = name
+
+        return region
+
+    axes: CollectionProperty(
+        type=OrigamiAxis
+    )
+
+    adjuster: bpy.props.FloatProperty(
+        name="Angle",
+        subtype='ANGLE',
+        default=0.0,
+        step=100,
+        update=update_timeline
+    )
+
+    origin: FloatVectorProperty(size=3)
 
 class OrigamiFold(PropertyGroup):
     pivot_3d: FloatVectorProperty(size=3)
@@ -53,9 +129,7 @@ class OrigamiFold(PropertyGroup):
         step=100,
         update=update_timeline
     )
-    seed_uv: FloatVectorProperty(size=2)
-    crease_uv_segments: CollectionProperty(type=OrigamiUVSegment)
-    region_faces: CollectionProperty(type=OrigamiFaceIndex)
+    region: PointerProperty(type=OrigamiRegion)
 
     selected: bpy.props.BoolProperty(
         name="Selected",
@@ -68,6 +142,12 @@ class OrigamiFold(PropertyGroup):
     interactions: CollectionProperty(
         type=FoldInteraction
     )
+
+class FoldOperation:
+
+    def __init__(self, region_faces, matrix):
+        self.region_faces = region_faces
+        self.matrix = matrix
 
 class RabbitEar(PropertyGroup):
     fold_a_index: IntProperty()
@@ -116,21 +196,6 @@ class PreviewFold:
         self.angle = angle
         self.region_faces = region_faces
 
-class FoldInteraction(PropertyGroup):
-
-    other_fold_index: IntProperty()
-
-    interaction_type: EnumProperty(
-        name="Interaction",
-        items=[
-            ("NONE", "None", ""),
-            ("CORNER_M", "Corner Mountain", ""),
-            ("CORNER_V", "Corner Valley", ""),
-            ("RABBIT", "Rabbit Ear", ""),
-        ],
-        default="NONE"
-    )
-
 class ORIGAMI_UL_fold_groups(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         group = item
@@ -170,7 +235,7 @@ class ORIGAMI_UL_folds(bpy.types.UIList):
         split = row.split(factor=0.6)
 
         split.label(
-            text=f"Fold {index}",
+            text=f"{len(fold.region.cached_faces)} faces",
             icon='MOD_SIMPLEDEFORM'
         )
 
@@ -180,7 +245,7 @@ class ORIGAMI_UL_folds(bpy.types.UIList):
             text=""
         )
 
-class ORIGAMI_UL_rabbit_ears(bpy.types.UIList):
+class ORIGAMI_UL_fold_interaction(bpy.types.UIList):
 
     def draw_item(
         self,
@@ -193,18 +258,18 @@ class ORIGAMI_UL_rabbit_ears(bpy.types.UIList):
         active_propname,
         index
     ):
-        rabbit_ear = item
+        interaction = item
 
         row = layout.row(align=True)
 
         row.prop(
-            rabbit_ear,
+            interaction,
             "selected",
             text=""
         )
 
         row.label(
-            text=f"FoldA: {rabbit_ear.fold_a_index} | FoldB: {rabbit_ear.fold_b_index}",
+            text=f"Type: {interaction.interaction_type} | Fold: {interaction.other_fold_index}",
             icon='MOD_SIMPLEDEFORM'
         )
 
@@ -243,6 +308,17 @@ def undo_post_handler(dummy):
             None
             #Can use this later to implement proper undo
 
+def clean_up_interactions(self, context):
+    for idx, group in enumerate(context.object.fold_groups):
+        print(f"GROUP {idx} ----------")
+        for f, fold in enumerate(group.folds):
+            print(f"fold {f}: axis-{fold.axis}, angle-{fold.angle}, faces-{[item.index for item in fold.region.cached_faces]}")
+            for i in range(len(fold.interactions) - 1, -1, -1):
+                interaction = fold.interactions[i]
+
+                if interaction.other_fold_index >= len(group.folds):
+                    fold.interactions.remove(i)
+
 def on_active_fold_changed(self, context):
     ensure_draw_handler()
     obj = context.object
@@ -251,6 +327,8 @@ def on_active_fold_changed(self, context):
 
     HIGHLIGHT_FACES.clear()
     DEBUG_UV_SEGMENTS.clear()
+    DEBUG_TESTED_EDGES.clear()
+    INTERACTION_UV_SEGMENT_LISTS.clear()
 
     g = obj.active_fold_group
     f = obj.active_fold
@@ -265,10 +343,27 @@ def on_active_fold_changed(self, context):
 
     fold = group.folds[f]
 
-    for uv_segment in fold.crease_uv_segments:
-        DEBUG_UV_SEGMENTS.append((uv_segment.a, uv_segment.b))
+    absolute_fold_index = 0
+    for i in range(g):
+        absolute_fold_index += len(obj.fold_groups[i].folds)
+    absolute_fold_index += f
 
-    for rf in fold.region_faces:
+    interactions = get_interactions_involving_fold(group, f)
+    #for edge in DEBUG_FLOODS[absolute_fold_index]:
+    #    DEBUG_TESTED_EDGES.append(edge)
+
+    if len(interactions) == 0 or interactions[0].interaction_type == 'NONE':
+        for uv_segment in fold.region.crease_uv_segments:
+            DEBUG_UV_SEGMENTS.append((uv_segment.a, uv_segment.b))
+    else:
+        for interaction in interactions:
+            for region in interaction.regions:
+                new_segment_list = []
+                for uv_segment in region.crease_uv_segments:
+                    new_segment_list.append((tuple(uv_segment.a), tuple(uv_segment.b)))
+                INTERACTION_UV_SEGMENT_LISTS.append(new_segment_list)
+
+    for rf in fold.region.cached_faces:
         HIGHLIGHT_FACES.append(rf.index)
 
     obj["_active_preview_fold"] = {
@@ -296,42 +391,373 @@ def on_active_group_changed(self, context):
             for fold in group.folds:
                 fold.selected = False
 
-def find_interaction(fold, other_index):
+def initialize_region_from_faces(obj, bm, region, face_indices, region_name="Base", seed_mode="first_face"):
 
-    for interaction in fold.interactions:
+    ensure_full_lookup_table(bm)
 
+    face_indices = set(face_indices)
+
+    if not face_indices:
+        raise ValueError("Cannot initialize region from empty face set")
+
+    uv_layer = bm.loops.layers.uv.active
+
+    if uv_layer is None:
+        raise RuntimeError("Mesh has no active UV layer")
+
+    region.region_name = region_name
+    region.crease_uv_segments.clear()
+    region.cached_faces.clear()
+
+    if seed_mode == "first_face":
+
+        seed_face_index = next(iter(face_indices))
+        seed_face = bm.faces[seed_face_index]
+
+        uv_sum = Vector((0.0, 0.0))
+
+        for loop in seed_face.loops:
+            uv_sum += loop[uv_layer].uv
+
+        region.seed_uv = uv_sum / len(seed_face.loops)
+
+    elif seed_mode == "centroid":
+
+        uv_sum = Vector((0.0, 0.0))
+        count = 0
+
+        for f_idx in face_indices:
+            f = bm.faces[f_idx]
+
+            for loop in f.loops:
+                uv_sum += loop[uv_layer].uv
+                count += 1
+
+        region.seed_uv = uv_sum / count
+
+    else:
+        raise ValueError(
+            f"Unknown seed_mode '{seed_mode}'"
+        )
+
+    seen_edges = set()
+
+    for f_idx in face_indices:
+
+        face = bm.faces[f_idx]
+
+        for loop in face.loops:
+
+            edge = loop.edge
+
+            if edge in seen_edges:
+                continue
+
+            seen_edges.add(edge)
+
+            is_boundary = False
+
+            for linked_face in edge.link_faces:
+
+                if linked_face.index not in face_indices:
+                    is_boundary = True
+                    break
+
+            if len(edge.link_faces) == 1:
+                is_boundary = True
+
+            if not is_boundary:
+                continue
+
+            uv1 = loop[uv_layer].uv.copy()
+            uv2 = loop.link_loop_next[uv_layer].uv.copy()
+
+            seg = region.crease_uv_segments.add()
+            seg.a = uv1
+            seg.b = uv2
+    for f_idx in face_indices:
+        item = region.cached_faces.add()
+        item.index = f_idx
+
+def build_group_operations(obj, bm, group, partial, preview_fold=None):
+
+    operations = []
+
+    handled_folds = set()
+    handled_interactions = set()
+    used_faces_dict = {i: set() for i in range(len(group.folds))}
+
+    for fold_index, fold in enumerate(group.folds):
+        interaction_folds = get_interactions_involving_fold(group, fold_index)
+        for interaction in interaction_folds:
+            
+            owner_index = interaction.owner_fold_index
+            other_index = interaction.other_fold_index
+
+            if getattr(group.folds[owner_index], "muted", False) or getattr(group.folds[other_index], "muted", False):
+                continue
+            
+            if interaction in handled_interactions:
+                continue
+
+            handled_folds.add(owner_index)
+            handled_folds.add(other_index)
+            handled_interactions.add(interaction)
+
+            match interaction.interaction_type:
+
+                case "RABBIT":
+
+                    evals = rabbit_ear_eval(
+                        group,
+                        interaction,
+                        partial,
+                        bm
+                    )
+
+                    operations.extend([
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("tip_A").cached_faces],
+                            evals["a_tip_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("tip_B").cached_faces],
+                            evals["b_tip_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("base_A").cached_faces],
+                            evals["a_base_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("base_B").cached_faces],
+                            evals["b_base_faces"]
+                        ),
+                    ])
+
+                case "CORNER_M":
+
+                    evals = corner_fold_eval(
+                        group,
+                        1,
+                        interaction,
+                        partial,
+                        bm
+                    )
+
+                    operations.extend([
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("corner_faces_a").cached_faces],
+                            evals["a_corner_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("corner_faces_b").cached_faces],
+                            evals["b_corner_faces"]
+                        ),
+                    ])
+                    
+                case "CORNER_V":
+
+                    evals = corner_fold_eval(
+                        group,
+                        -1,
+                        interaction,
+                        partial,
+                        bm
+                    )
+
+                    operations.extend([
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("corner_faces_a").cached_faces],
+                            evals["a_corner_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("corner_faces_b").cached_faces],
+                            evals["b_corner_faces"]
+                        ),
+                    ])
+
+                case "COLLAPSE":
+
+                    evals = collapse_fold_eval(
+                        group,
+                        interaction,
+                        partial,
+                        bm
+                    )
+
+                    operations.extend([
+
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("tip_A").cached_faces],
+                            evals["a_tip_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("tip_B").cached_faces],
+                            evals["b_tip_faces"]
+                        ),
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("top").cached_faces],
+                            evals["top_faces"]
+                        ),
+                    ])
+
+                case "NESTED":
+
+                    evals = nested_fold_eval(
+                        group,
+                        interaction,
+                        partial,
+                        bm
+                    )
+                    interaction.get_region("child").cached_faces
+                    operations.extend([
+                        FoldOperation(
+                            [item.index for item in interaction.get_region("child").cached_faces],
+                            evals["child_faces"]
+                        ),
+                    ])
+
+            for op in operations:
+                used_faces_dict[owner_index].update(op.region_faces)
+                used_faces_dict[other_index].update(op.region_faces)
+
+    group_folds = list(group.folds)
+
+    if preview_fold:
+        group_folds = [preview_fold]
+
+    for fold_index, fold in enumerate(group_folds):
+        
+        if isinstance(fold, PreviewFold):
+            region_faces = fold.region_faces
+        else:
+            if getattr(fold, "muted", False):
+                continue
+
+            fold_faces = {
+                f.index
+                for f in fold.region.cached_faces
+            }
+
+            remaining_faces = (
+                fold_faces
+                - used_faces_dict[fold_index]
+            )
+            region_faces = list(remaining_faces)
+
+            if fold_index in handled_folds and not remaining_faces:
+                continue
+
+        angle = fold.angle * partial
+
+        rot = fold_matrix(
+            Vector(fold.pivot_3d),
+            Vector(fold.axis).normalized(),
+            angle
+        )
+
+        operations.append(
+            FoldOperation(
+                region_faces,
+                rot
+            )
+        )
+
+    return operations
+
+def find_group_for_interaction(groups, target_interaction):
+    for group in groups:
+        for fold in group.folds:
+            for interaction in fold.interactions:
+                if interaction == target_interaction:
+                    return group
+    return None
+
+def find_interaction(group, owner_index, other_index):
+
+    for interaction in group.folds[owner_index].interactions:
         if interaction.other_fold_index == other_index:
             return interaction
 
     return None
 
-def ensure_interaction(fold, other_index):
-
-    interaction = find_interaction(
-        fold,
-        other_index
-    )
+def ensure_interaction(group, owner_index, other_index):
+    interaction = find_interaction(group, owner_index, other_index)
 
     if interaction:
         return interaction
 
-    interaction = fold.interactions.add()
+    interaction = group.folds[owner_index].interactions.add()
+    interaction.owner_fold_index = owner_index
     interaction.other_fold_index = other_index
 
     return interaction
-    
+
+def get_interactions_involving_fold(group, index):
+    interaction_acc = []
+    for index, fold in enumerate(group.folds):
+        for interaction in fold.interactions:
+            if interaction.other_fold_index > index:
+                interaction_acc.append(interaction)
+
+    return interaction_acc
+
+def build_interaction_data_from_type(interaction, context):
+    obj = context.object
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    group = find_group_for_interaction(obj.fold_groups, interaction)
+    match interaction.interaction_type:
+        case "RABBIT":
+            build_rabbit_interaction_data(obj, bm, group, interaction, True)
+        case "CORNER_M":
+            build_corner_interaction_data(obj, bm, group, interaction)
+        case "CORNER_V":
+            build_corner_interaction_data(obj, bm, group, interaction)
+        case "COLLAPSE":
+            build_collapse_interaction_data(obj, bm, group, interaction)
+        case "NESTED":
+            build_nested_interaction_data(obj, bm, group, interaction)
+
+def interactions_for_fold(group, fold_index):
+    result = []
+
+    for owner_index, fold in enumerate(group.folds):
+        for interaction in fold.interactions:
+
+            if owner_index == fold_index:
+                result.append(interaction)
+
+            elif interaction.other_fold_index == fold_index:
+                result.append(interaction)
+
+    return result
+
+def shares_face(fold_a, fold_b):
+    faces_a = {face.index for face in fold_a.region.cached_faces}
+    faces_b = {face.index for face in fold_b.region.cached_faces}
+
+    return not faces_a.isdisjoint(faces_b)
+
 def check_new_overlapping_folds(self, context, group_index, new_fold_index):
     obj = context.object
-    for index, fold in enumerate(obj.fold_groups[group_index].folds):
+    group = obj.fold_groups[group_index]
+    new_fold = group.folds[new_fold_index]
+    for index, fold in enumerate(group.folds):
         if index != new_fold_index:
-            shared_faces = fold.region_faces.intersection(obj.fold_groups[group_index].folds[new_fold_index])
-            if (shared_faces):
-                prompt_user_for_fold_interaction(self, context, group_index, index, new_fold_index)
+            if (shares_face(fold, new_fold)):
+                ensure_interaction(group, index, new_fold_index)
 
 def closest_point_on_edge(p, a, b):
     ab = b - a
-    t = (p - a).dot(ab) / ab.dot(ab)
+    denom = ab.dot(ab)
+
+    if denom < 1e-12:
+        return a.copy()
+
+    t = (p - a).dot(ab) / denom
     t = max(0.0, min(1.0, t))
+
     return a + ab * t
 
 def uv_equal(a, b):
@@ -355,11 +781,12 @@ def edge_lies_on_crease(e1, e2, crease_segments):
     def project_scalar(p, origin, direction):
         return (p - origin).dot(direction)
 
-    DIST_EPS = 0.01
-    ANGLE_EPS = 0.98  
+    ANGLE_EPS = 0.95
 
     edge_dir = (e2 - e1)
     edge_len = edge_dir.length
+
+    DIST_EPS = 0.05 * edge_len
 
     if edge_len < 1e-8:
         return False
@@ -401,7 +828,7 @@ def edge_lies_on_crease(e1, e2, crease_segments):
 
         if overlap > -DIST_EPS:
             return True
-
+    #DEBUG_TESTED_EDGES.append((e1,e2))
     return False
 
 def crosses_crease_uv(bm, f1_idx, f2_idx, uv_layer, crease_uv_segments):
@@ -415,6 +842,7 @@ def crosses_crease_uv(bm, f1_idx, f2_idx, uv_layer, crease_uv_segments):
 
     if edge_uvs is None:
         return False
+
 
     e1, e2 = edge_uvs
 
@@ -430,7 +858,7 @@ def shared_uv_edge_between_faces(bm, f1_idx, f2_idx, uv_layer):
     f2 = bm.faces[f2_idx]
 
     shared_edges = set(f1.edges) & set(f2.edges)
-    if len(shared_edges) != 1:
+    if len(shared_edges) < 1:
         return None
 
     if not shared_edges:
@@ -452,7 +880,7 @@ def uv_curve_flood_fill(bm, seed_idx, adjacency, uv_layer, crease_uv_segments):
     visited = set()
     stack = [seed_idx]
     ensure_full_lookup_table(bm)
-
+    DEBUG_TESTED_EDGES.clear()
     while stack:
         f_idx = stack.pop()
 
@@ -471,10 +899,12 @@ def uv_curve_flood_fill(bm, seed_idx, adjacency, uv_layer, crease_uv_segments):
 
             stack.append(n)
 
+    #DEBUG_FLOODS.append(DEBUG_TESTED_EDGES.copy())
+
     return visited
 
 def rebuild_regions_from_seed_uv(obj, bm, group=None):
-
+    DEBUG_FLOODS.clear()
     uv_layer = bm.loops.layers.uv.active
 
     adjacency = build_face_graph(bm, set())
@@ -484,7 +914,7 @@ def rebuild_regions_from_seed_uv(obj, bm, group=None):
             continue 
         for fold in g.folds:
 
-            seed_face = find_face_from_seed_uv(bm, uv_layer, fold.seed_uv)
+            seed_face = find_face_from_seed_uv(bm, uv_layer, fold.region.seed_uv)
             if not seed_face:
                 print("NO SEED FACE")
                 continue
@@ -493,13 +923,33 @@ def rebuild_regions_from_seed_uv(obj, bm, group=None):
                 seed_face.index,
                 adjacency,
                 uv_layer,
-                fold.crease_uv_segments
+                fold.region.crease_uv_segments
             )
 
-            fold.region_faces.clear()
+            fold.region.cached_faces.clear()
             for f_idx in region:
-                item = fold.region_faces.add()
+                item = fold.region.cached_faces.add()
                 item.index = f_idx
+
+            for interaction in fold.interactions:
+                for region in interaction.regions:
+                    seed_face = find_face_from_seed_uv(bm, uv_layer, region.seed_uv)
+                    if not seed_face:
+                        print("NO SEED FACE")
+                        continue
+                    region_faces = uv_curve_flood_fill(
+                        bm,
+                        seed_face.index,
+                        adjacency,
+                        uv_layer,
+                        region.crease_uv_segments
+                    )
+
+                    region.cached_faces.clear()
+                    for f_idx in region_faces:
+                        item = region.cached_faces.add()
+                        item.index = f_idx
+                    print(f"region {region.region_name} has {len(region.cached_faces)} faces")
     
 def find_face_from_seed_uv(bm, uv_layer, seed_uv):
     seed_uv = Vector(seed_uv)
@@ -588,12 +1038,6 @@ def depsgraph_handler(scene, depsgraph):
             obj["_topo_edge_len"] = len(bm.edges)
             obj["_topo_face_len"] = len(bm.faces)
             rebuild_regions_from_seed_uv(obj, bm)
-            current_timeline = obj.fold_timeline
-            for index, group in enumerate(obj.fold_groups):
-                for rabbit_ear in group.rabbit_ears:
-                    FoldEvaluator.evaluate(obj, index)
-                    apply_rabbit_to_group(obj, bm, group, rabbit_ear.fold_a_index, rabbit_ear.fold_b_index)
-            FoldEvaluator.evaluate(obj, current_timeline)
 
 def origami_frame_update(scene):
 
@@ -642,6 +1086,7 @@ def apply_crease_path(bm, path, threshold=1e-6):
     ensure_full_lookup_table(bm)
 
     node_to_vert = {}
+    new_verts = []
 
     for node in path.nodes:
         if node.kind == "EXISTING_VERT" and node.vert and node.vert.is_valid:
@@ -715,6 +1160,7 @@ def apply_crease_path(bm, path, threshold=1e-6):
 
             new_vert.co = node.co.copy()
             node_to_vert[node.id] = new_vert
+            new_verts.append(new_vert)
 
             current_edge = new_edge
             current_start = new_vert
@@ -748,6 +1194,7 @@ def apply_crease_path(bm, path, threshold=1e-6):
                 pass
 
     ensure_full_lookup_table(bm)
+    return new_verts
 
 def signed_plane_distance(p, plane_co, plane_no):
     return (p - plane_co).dot(plane_no)
@@ -901,12 +1348,13 @@ def angle_bisector(axis_a, axis_b):
 
     return bisector.normalized()
 
-def build_corner_fold_from_folds(obj, bm, group, fold_a_index, fold_b_index):
-    foldA = group.folds[fold_a_index]
-    foldB = group.folds[fold_b_index]
+def build_corner_interaction_data(obj, bm, group, interaction):
 
-    facesA = {f.index for f in foldA.region_faces}
-    facesB = {f.index for f in foldB.region_faces}
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
+
+    facesA = {f.index for f in foldA.region.cached_faces}
+    facesB = {f.index for f in foldB.region.cached_faces}
 
     overlap = facesA & facesB
 
@@ -919,12 +1367,6 @@ def build_corner_fold_from_folds(obj, bm, group, fold_a_index, fold_b_index):
     axisA = Vector(foldA.axis).normalized()
     axisB = Vector(foldB.axis).normalized()
 
-    bisector = angle_bisector(axisA, axisB)
-
-    if bisector is None:
-        print("Corner fold failed: axes cancel out")
-        return None
-
     p1 = Vector(foldA.pivot_3d)
     p2 = Vector(foldB.pivot_3d)
 
@@ -934,6 +1376,32 @@ def build_corner_fold_from_folds(obj, bm, group, fold_a_index, fold_b_index):
         p2,
         axisB
     )
+    print("origin: ",origin)
+
+    centroidA = region_centroid(bm, list(onlyA))
+    centroidB = region_centroid(bm, list(onlyB))
+
+    dirA = (centroidA - origin)
+    dirB = (centroidB - origin)
+
+    if dirA.length < 1e-6 or dirB.length < 1e-6:
+        print("Corner fold failed: degenerate centroids")
+        return None
+
+    dirA.normalize()
+    dirB.normalize()
+
+    split_dir = dirA - dirB
+
+    if split_dir.length < 1e-6:
+        print("Corner fold failed: split direction collapsed")
+        return None
+
+    split_dir.normalize()
+
+    bisector = axisA + axisB
+    up_down = bisector.cross(split_dir)
+    real_split_dir = up_down.cross(bisector)
 
     side_a = []
     side_b = []
@@ -941,152 +1409,184 @@ def build_corner_fold_from_folds(obj, bm, group, fold_a_index, fold_b_index):
     eps = 0.0001 * obj.scale.length
 
     for f_idx in overlap:
-        face = bm.faces[f_idx]
+        center = bm.faces[f_idx].calc_center_median()
 
-        center = face.calc_center_median()
-
-        d = (center - origin).dot(bisector)
+        d = (center - origin).dot(real_split_dir)
 
         if d >= -eps:
             side_a.append(f_idx)
         else:
             side_b.append(f_idx)
 
-    return {
-        "axis_a": axisA,
-        "axis_b": axisB,
-        "pivot": origin,
-        "base_faces_a": list(onlyA),
-        "base_faces_b": list(onlyB),
-        "corner_faces_a": side_a,
-        "corner_faces_b": side_b,
+    if axisA.dot(axisB) > 0:
+        axisB = -axisB
+
+    new_axisA = interaction.axes.add()
+    new_axisA.value = axisA
+    new_axisB = interaction.axes.add()
+    new_axisB.value = axisB
+
+    interaction.origin = origin
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, list(onlyA), "base_faces_a")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, list(onlyB), "base_faces_b")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, side_a, "corner_faces_a")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, side_b, "corner_faces_b")
+
+def build_collapse_interaction_data(obj, bm, group, interaction):
+
+    def classify_face_for_collapse(c, origin, nA, nMid, nB, eps):
+        dA = (c - origin).dot(nA)
+        dMid = (c - origin).dot(nMid)
+        dB = (c - origin).dot(nB)
+
+        if dA >= -eps and dMid >= -eps:
+            return "base_A"
+        elif dA < -eps and dMid >= -eps:
+            return "tip_A"
+        elif dMid < -eps and dB >= -eps:
+            return "tip_B"
+        else:
+            return "base_B"
+    
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
+
+    facesA = {f.index for f in foldA.region.cached_faces}
+    facesB = {f.index for f in foldB.region.cached_faces}
+
+    first_face_index = foldA.region.cached_faces[0].index
+    paper_normal = bm.faces[first_face_index].normal
+
+    overlap = facesA & facesB
+    total_faces = facesA | facesB
+
+    if not overlap:
+        return None
+
+    onlyA = facesA - overlap
+    onlyB = facesB - overlap
+
+    a = Vector(foldA.axis).normalized()
+    b = Vector(foldB.axis).normalized()
+    p1 = Vector(foldA.pivot_3d)
+    p2 = Vector(foldB.pivot_3d)
+    origin = closest_point_between_lines(p1, a, p2, b)
+
+    centroidA = Vector(region_centroid(bm, [
+        rf.index for rf in foldA.region.cached_faces
+    ]))
+
+    centroidB = Vector(region_centroid(bm, [
+        rf.index for rf in foldB.region.cached_faces
+    ]))
+
+    dirA = (centroidA - origin).normalized()
+    dirB = (centroidB - origin).normalized()
+
+    v = dirA - dirB
+    if v.length < 1e-6 or not all(math.isfinite(c) for c in v):
+        print("ERROR: Both directions for centroids are the same")
+        return None
+    ensure_full_lookup_table(bm)
+    if a.dot(b) > 0:
+        b = -b
+    split_dir = (dirA - dirB).normalized()
+
+    axisA = Vector(foldA.axis).normalized()
+    axisB = Vector(foldB.axis).normalized()
+
+    reflected_normalA = reflect_vector_about_axis(split_dir, axisA).normalized()
+    reflected_normalB = reflect_vector_about_axis(split_dir, axisB).normalized()
+
+    working_faces = total_faces
+
+    overlap_faces = [bm.faces[i] for i in total_faces if i < len(bm.faces)]
+    candidate_faces = [
+        bm.faces[i]
+        for i in total_faces
+        if i < len(bm.faces)
+    ]
+    overlap_edges = set()
+    for f in overlap_faces:
+        overlap_edges.update(f.edges)
+    geom = list(overlap_faces) + list(overlap_edges)
+
+    facesA = {f.index for f in foldA.region.cached_faces}
+    facesB = {f.index for f in foldB.region.cached_faces}
+    working_faces = onlyA | onlyB
+
+    eps = 0.001 * obj.scale.length
+    
+    new_regions = {
+        "base_A": [],
+        "tip_A": [],
+        "tip_B": [],
+        "base_B": [],
+        "top": []
     }
+    for f in overlap:
+        new_regions["top"].append(f)
+    for f in working_faces:
+        c = bm.faces[f].calc_center_median()
+        region = classify_face_for_collapse(c, origin, reflected_normalA, split_dir, reflected_normalB, eps)
+        new_regions[region].append(f)
 
-def apply_corner_fold_to_group(obj, bm, group, fold_a_index, fold_b_index):
-    indices = (fold_a_index, fold_b_index)
+    interaction.axes.clear()
 
-    for i in range(len(group.corner_folds) - 1, -1, -1):
-        corner = group.corner_folds[i]
+    new_axis = interaction.axes.add()
+    new_axis.value = split_dir
 
-        if (
-            corner.fold_a_index in indices or
-            corner.fold_b_index in indices
-        ):
-            group.corner_folds.remove(i)
+    interaction.origin = origin
 
-    data = build_corner_fold_from_folds(
-        obj,
-        bm,
-        group,
-        fold_a_index,
-        fold_b_index
-    )
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["base_A"], "base_A")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["base_B"], "base_B")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["tip_A"], "tip_A")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["tip_B"], "tip_B")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["top"], "top")
 
-    if not data:
-        return
+def build_nested_interaction_data(obj, bm, group, interaction):
+    
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
 
-    corner = group.corner_folds.add()
+    facesA = {f.index for f in foldA.region.cached_faces}
+    facesB = {f.index for f in foldB.region.cached_faces}
 
-    corner.fold_a_index = fold_a_index
-    corner.fold_b_index = fold_b_index
+    overlap = facesA & facesB
 
-    corner.axis_a = data["axis_a"]
-    corner.axis_b = data["axis_b"]
-    corner.pivot = data["pivot"]
+    if not overlap:
+        return None
 
-    def fill(collection, faces):
-        collection.clear()
+    onlyA = facesA - overlap
+    onlyB = facesB - overlap
 
-        for f_idx in faces:
-            item = collection.add()
-            item.index = f_idx
+    parent_faces = onlyA
+    child_faces = overlap
+    if len(onlyA) == 0:
+        parent_faces = onlyB
+    
+    new_regions = {
+        "parent": [],
+        "child": [],
+    }
+    for f in parent_faces:
+        new_regions["parent"].append(f)
+    for f in child_faces:
+        new_regions["child"].append(f)
 
-    fill(
-        corner.region_a_base_faces,
-        data["base_faces_a"]
-    )
-
-    fill(
-        corner.region_b_base_faces,
-        data["base_faces_b"]
-    )
-
-    fill(
-        corner.region_a_corner_faces,
-        data["corner_faces_a"]
-    )
-
-    fill(
-        corner.region_b_corner_faces,
-        data["corner_faces_b"]
-    )
-
-def apply_rabbit_to_group(obj, bm, group, fold_a_index, fold_b_index, cut=True):
-    indices = (fold_a_index, fold_b_index)
-
-    for i in range(len(group.rabbit_ears) - 1, -1, -1):
-        rabbit_ear = group.rabbit_ears[i]
-        
-        if (rabbit_ear.fold_a_index in indices or
-            rabbit_ear.fold_b_index in indices):
-            group.rabbit_ears.remove(i)
-
-    data, center = build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
-    if not data:
-        return
-    rabbit = group.rabbit_ears.add()
-
-    edge_a = find_shared_edge_between_regions(
-        bm,
-        data["base_A"],
-        data["tip_A"]
-    )
-
-    edge_b = find_shared_edge_between_regions(
-        bm,
-        data["base_B"],
-        data["tip_B"]
-    )
-    foldA_axis = group.folds[fold_a_index].axis
-    foldB_axis = group.folds[fold_b_index].axis
-
-    if edge_a:
-        v1, v2 = edge_a.verts
-        axis = (v2.co - v1.co).normalized()
-        if axis.dot(foldA_axis) < 0:
-            rabbit.axis_a = -axis
-        else:
-            rabbit.axis_a = axis
-
-    if edge_b:
-        v1, v2 = edge_b.verts
-        axis = (v2.co - v1.co).normalized()
-        if axis.dot(foldB_axis) < 0:
-            rabbit.axis_b = -axis
-        else:
-            rabbit.axis_b = axis
-
-
-    rabbit.center = center
-
-
-    rabbit.fold_a_index = fold_a_index
-    rabbit.fold_b_index = fold_b_index
-
-    def fill(col, faces):
-        col.clear()
-        for f in faces:
-            item = col.add()
-            item.index = f
-
-    fill(rabbit.region_a_base_faces, data["base_A"])
-    fill(rabbit.region_b_base_faces, data["base_B"])
-    fill(rabbit.region_a_tip_faces, data["tip_A"])
-    fill(rabbit.region_b_tip_faces, data["tip_B"])
-
-    if not edge_a or not edge_b:
-        print("ERROR: No shared edge between rabbit ear regions")
-        return
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["parent"], "parent")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, new_regions["child"], "child")
 
 def get_rabbit_bisector_plane(foldA, foldB, bm):
 
@@ -1109,7 +1609,7 @@ def get_rabbit_bisector_plane(foldA, foldB, bm):
 
     return origin, plane_normal
 
-def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut):
+def build_rabbit_interaction_data(obj, bm, group, interaction, cut):
 
     def classify_face_for_rabbit(c, origin, nA, nMid, nB, eps):
         dA = (c - origin).dot(nA)
@@ -1125,13 +1625,13 @@ def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
         else:
             return "base_B"
     
-    foldA = group.folds[fold_a_index]
-    foldB = group.folds[fold_b_index]
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
 
-    facesA = {f.index for f in foldA.region_faces}
-    facesB = {f.index for f in foldB.region_faces}
+    facesA = {f.index for f in foldA.region.cached_faces}
+    facesB = {f.index for f in foldB.region.cached_faces}
 
-    first_face_index = foldA.region_faces[0].index
+    first_face_index = foldA.region.cached_faces[0].index
     paper_normal = bm.faces[first_face_index].normal
 
     overlap = facesA & facesB
@@ -1143,18 +1643,18 @@ def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
     onlyA = facesA - overlap
     onlyB = facesB - overlap
 
-    a = Vector(foldA.axis).normalized()
-    b = Vector(foldB.axis).normalized()
+    axisA = Vector(foldA.axis).normalized()
+    axisB = Vector(foldB.axis).normalized()
     p1 = Vector(foldA.pivot_3d)
     p2 = Vector(foldB.pivot_3d)
-    origin = closest_point_between_lines(p1, a, p2, b)
+    origin = closest_point_between_lines(p1, axisA, p2, axisB)
 
     centroidA = Vector(region_centroid(bm, [
-        rf.index for rf in foldA.region_faces
+        rf.index for rf in foldA.region.cached_faces
     ]))
 
     centroidB = Vector(region_centroid(bm, [
-        rf.index for rf in foldB.region_faces
+        rf.index for rf in foldB.region.cached_faces
     ]))
 
     dirA = (centroidA - origin).normalized()
@@ -1165,12 +1665,9 @@ def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
         print("ERROR: Both directions for centroids are the same")
         return None
     ensure_full_lookup_table(bm)
-    if a.dot(b) > 0:
-        b = -b
+    if axisA.dot(axisB) > 0:
+        axisB = -axisB
     split_dir = (dirA - dirB).normalized()
-
-    axisA = Vector(foldA.axis).normalized()
-    axisB = Vector(foldB.axis).normalized()
 
     reflected_normalA = reflect_vector_about_axis(split_dir, axisA).normalized()
     reflected_normalB = reflect_vector_about_axis(split_dir, axisB).normalized()
@@ -1224,26 +1721,48 @@ def build_rabbit_ear_from_folds(obj, bm, group, fold_a_index, fold_b_index, cut)
     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
     ensure_full_lookup_table(bm)
     rebuild_regions_from_seed_uv(obj, bm, group)
-    facesA = {f.index for f in foldA.region_faces}
-    facesB = {f.index for f in foldB.region_faces}
+    facesA = {f.index for f in foldA.region.cached_faces}
+    facesB = {f.index for f in foldB.region.cached_faces}
     working_faces = facesA | facesB
 
     eps = 0.001 * obj.scale.length
     
-    regions = {
+    rabbit_regions = {
         "base_A": [],
         "tip_A": [],
         "tip_B": [],
         "base_B": []
     }
-
     for f in working_faces:
         c = bm.faces[f].calc_center_median()
         region = classify_face_for_rabbit(c, origin, reflected_normalA, split_dir, reflected_normalB, eps)
-        regions[region].append(f)
-    return regions, origin
+        rabbit_regions[region].append(f)
 
-def rabbit_ear_eval(rabbit, foldA, foldB, t, bm):
+    interaction.axes.clear()
+    new_axisA = interaction.axes.add()
+    new_axisA.value = reflected_normalA
+    new_axisB = interaction.axes.add()
+    new_axisB.value = reflected_normalB
+    new_axisC = interaction.axes.add()
+    new_axisC.value = axisA + axisB
+    interaction.origin = origin
+
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, rabbit_regions["base_A"], "base_A")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, rabbit_regions["base_B"], "base_B")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, rabbit_regions["tip_A"], "tip_A")
+    new_region = interaction.regions.add()
+    initialize_region_from_faces(obj, bm, new_region, rabbit_regions["tip_B"], "tip_B")
+
+def rabbit_ear_eval(group, interaction, t, bm):
+
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
+
+    adjustmentAngle = interaction.adjuster
+
     A = fold_matrix(
         Vector(foldA.pivot_3d),
         Vector(foldA.axis).normalized(),
@@ -1256,69 +1775,162 @@ def rabbit_ear_eval(rabbit, foldA, foldB, t, bm):
         foldB.angle * t
     )
 
-    origin, normal = get_rabbit_bisector_plane(foldA, foldB, bm)
+    angle = (foldA.angle + foldB.angle) * 0.5 * t
 
-    paper_normal = compute_paper_normal(bm)
-    bisector_axis = normal.cross(paper_normal).normalized()
+    C = fold_matrix(
+        Vector(interaction.origin),
+        Vector(interaction.axes[0].value).normalized(),
+        foldB.angle * t/2
+    )
+    
+    D = fold_matrix(
+        Vector(interaction.origin),
+        Vector(interaction.axes[1].value).normalized(),
+        foldA.angle * t/2
+    )
+
+    E = fold_matrix(
+        Vector(interaction.origin),
+        Vector(interaction.axes[2].value).normalized(),
+        adjustmentAngle * t
+    )
+
+    print(Vector(interaction.axes[2].value))
+
+    return {
+        "a_base_faces": A,
+        "b_base_faces": B, 
+        "a_tip_faces": E @ A @ D,   
+        "b_tip_faces": E @ B @ C
+    }
+
+def corner_fold_eval(group, sign, interaction, t, bm):
+
+    angle_modifier = -0.5
+    if (sign == 1):
+        angle_modifier = 1.5
+
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
+
+    adjustmentAngle = interaction.adjuster
+
+    upAxis = Vector(foldA.axis).cross(Vector(foldB.axis)).normalized()
+
+    A = fold_matrix(
+        Vector(foldA.pivot_3d),
+        Vector(foldA.axis).normalized(),
+        foldA.angle * t
+    )
+
+    B = fold_matrix(
+        Vector(foldB.pivot_3d),
+        Vector(foldB.axis).normalized(),
+        foldB.angle * t
+    )
+
+
+    C = fold_matrix(
+        Vector(interaction.origin),
+        Vector(foldB.axis).normalized(),
+        foldB.angle * t * angle_modifier
+    )
+    
+    D = fold_matrix(
+        Vector(interaction.origin),
+        Vector(foldA.axis).normalized(),
+        foldA.angle * t * angle_modifier
+    )
+
+    E = fold_matrix(
+        Vector(interaction.origin),
+        upAxis,
+        adjustmentAngle * t
+    )
+
+
+    return {
+        "a_base_faces": A,
+        "b_base_faces": B, 
+        "a_corner_faces": E @ A @ C,   
+        "b_corner_faces": E @ B @ D
+    }
+
+def collapse_fold_eval(group, interaction, t, bm):
+
+    foldA = group.folds[interaction.owner_fold_index]
+    foldB = group.folds[interaction.other_fold_index]
+
+    flipA = -1
+    flipB = -1
+    if (Vector(interaction.axes[0].value).dot(foldA.axis) > 0):
+        flipA = 1
+    if (Vector(interaction.axes[0].value).dot(foldB.axis) > 0):
+        flipB = 1
+    
+    
+
+    A = fold_matrix(
+        Vector(foldA.pivot_3d),
+        Vector(foldA.axis).normalized(),
+        foldA.angle * t
+    )
+
+    B = fold_matrix(
+        Vector(foldB.pivot_3d),
+        Vector(foldB.axis).normalized(),
+        foldB.angle * t
+    )
 
     angle = (foldA.angle + foldB.angle) * 0.5 * t
 
     C = fold_matrix(
-        Vector(rabbit.center),
-        Vector(rabbit.axis_a).normalized(),
-        foldA.angle * -t/2
+        Vector(interaction.origin),
+        Vector(interaction.axes[0].value).normalized(),
+        foldA.angle * flipA * -t
     )
     
     D = fold_matrix(
-        Vector(rabbit.center),
-        Vector(rabbit.axis_b).normalized(),
-        foldB.angle * -t/2
+        Vector(interaction.origin),
+        Vector(interaction.axes[0].value).normalized(),
+        foldB.angle * flipB * -t
+    )
+
+    E = fold_matrix(
+        Vector(interaction.origin),
+        Vector(interaction.axes[0].value).normalized(),
+        foldB.angle * flipB * t
     )
 
     return {
         "a_base_faces": A,
         "b_base_faces": B, 
         "a_tip_faces": A @ C,   
-        "b_tip_faces": B @ D
+        "b_tip_faces": B @ D,
+        "top_faces": E
     }
 
-def corner_fold_eval(corner, foldA, foldB, t, bm):
+def nested_fold_eval(group, interaction, t, bm):
+
+    parentFold = group.folds[interaction.owner_fold_index]
+    childFold = group.folds[interaction.other_fold_index]
+
+
     A = fold_matrix(
-        Vector(foldA.pivot_3d),
-        Vector(foldA.axis).normalized(),
-        foldA.angle * t
+        Vector(parentFold.pivot_3d),
+        Vector(parentFold.axis).normalized(),
+        parentFold.angle * t
     )
 
     B = fold_matrix(
-        Vector(foldB.pivot_3d),
-        Vector(foldB.axis).normalized(),
-        foldB.angle * t
-    )
-
-    origin, normal = get_rabbit_bisector_plane(foldA, foldB, bm)
-
-    paper_normal = compute_paper_normal(bm)
-    bisector_axis = normal.cross(paper_normal).normalized()
-
-    angle = (foldA.angle + foldB.angle) * 0.5 * t
-
-    C = fold_matrix(
-        Vector(corner.pivot),
-        Vector(corner.axis_b).normalized(),
-        foldA.angle * -t/2
-    )
-    
-    D = fold_matrix(
-        Vector(corner.pivot),
-        Vector(corner.axis_a).normalized(),
-        foldB.angle * -t/2
+        Vector(childFold.pivot_3d),
+        Vector(childFold.axis).normalized(),
+        childFold.angle * t
     )
 
     return {
-        "a_base_faces": A,
-        "b_base_faces": B, 
-        "a_corner_faces": A @ C,   
-        "b_corner_faces": B @ D
+        "parent_faces": A,
+        "child_faces": A @ B
     }
 
 def region_centroid(bm, face_indices):
@@ -1478,12 +2090,6 @@ def ensure_full_lookup_table(bm):
 class FoldEvaluator:
     @staticmethod
     def evaluate(obj, timeline, preview_fold=None):
-        obj["origami_topology_version"] = obj.get("origami_topology_version", 0)
-        if obj.get("origami_topology_dirty", False):
-            print("It's dirty")
-
-            obj["origami_topology_dirty"] = False
-            obj["origami_topology_version"] += 1
             
         me = obj.data
         
@@ -1534,82 +2140,37 @@ class FoldEvaluator:
             group_vert_xforms = {}
             group_folds = list(group.folds)
             group_face_xforms = {f.index: [] for f in bm.faces}
-            if preview_fold and gi == full - 1:
-                group_folds = [preview_fold]
-            handled_folds = set()
-            for fold in group.folds:
-                if fold.muted:
-                    handled_folds.add(fold)
-            for rabbit in group.rabbit_ears:
 
-                foldA = group.folds[rabbit.fold_a_index]
-                foldB = group.folds[rabbit.fold_b_index]
-                handled_folds.add(foldA)
-                handled_folds.add(foldB)
-                new_partial =  partial if gi == full else 1
-                evals = rabbit_ear_eval(rabbit, foldA, foldB, new_partial, bm)
+            if (gi == full - 1):
+                operations = build_group_operations(
+                    obj,
+                    bm,
+                    group,
+                    partial if gi == full else 1.0,
+                    preview_fold,
+                )
+            else:
+                operations = build_group_operations(
+                    obj,
+                    bm,
+                    group,
+                    partial if gi == full else 1.0,
+                    None,
+                )
 
-                region_map = {
-                    "a_base_faces": evals["a_base_faces"],
-                    "b_base_faces": evals["b_base_faces"],
-                    "a_tip_faces": evals["a_tip_faces"],
-                    "b_tip_faces": evals["b_tip_faces"],
-                }
+            group_face_xforms = defaultdict(list)
 
-                for region_name, matrix in region_map.items():
-                    faces = getattr(rabbit, f"region_{region_name}")
-                    for item in faces:
-                        f_idx = item.index
-                        group_face_xforms[f_idx].append((rabbit, matrix))
+            for op in operations:
+                for f_idx in op.region_faces:
+                    group_face_xforms[f_idx].append(op.matrix)
 
-            for corner in group.corner_folds:
-
-                foldA = group.folds[corner.fold_a_index]
-                foldB = group.folds[corner.fold_b_index]
-                handled_folds.add(foldA)
-                handled_folds.add(foldB)
-                new_partial =  partial if gi == full else 1
-                evals = corner_fold_eval(corner, foldA, foldB, new_partial, bm)
-
-                region_map = {
-                    "a_base_faces": evals["a_base_faces"],
-                    "b_base_faces": evals["b_base_faces"],
-                    "a_corner_faces": evals["a_corner_faces"],
-                    "b_corner_faces": evals["b_corner_faces"],
-                }
-
-                for region_name, matrix in region_map.items():
-                    faces = getattr(corner, f"region_{region_name}")
-                    for item in faces:
-                        f_idx = item.index
-                        group_face_xforms[f_idx].append((corner, matrix))
-
-            for fold in group_folds:
-                if fold in handled_folds:
-                    continue
-                angle = fold.angle * partial if gi == full else fold.angle
-
-                rot = fold_matrix( 
-                    Vector(fold.pivot_3d), 
-                    Vector(fold.axis).normalized(), 
-                    angle 
-                ) 
-                
-                if isinstance(fold, PreviewFold): 
-                    region_faces = fold.region_faces 
-                else: 
-                    region_faces = [item.index for item in fold.region_faces] 
-                
-                for f_idx in region_faces: 
-                    group_face_xforms[f_idx].append((fold, rot)) 
-                    
             for f_idx, fold_mats in group_face_xforms.items():
                 if not fold_mats:
                     continue
 
                 T = Matrix.Identity(4)
 
-                for _, mat in fold_mats:
+                for mat in fold_mats:
                     T = mat @ T
 
                 face_xforms[f_idx] = T @ face_xforms[f_idx]
@@ -1846,6 +2407,7 @@ class ORIGAMI_OT_pick_side(Operator):
 
     def _commit_fold(self, context):
         
+        bm = bmesh.from_edit_mesh(self.obj.data)
         group_index = int(self.obj.fold_timeline)
 
         while len(self.obj.fold_groups) <= group_index:
@@ -1857,64 +2419,15 @@ class ORIGAMI_OT_pick_side(Operator):
         fold.pivot_3d = self.pivot_3d
         fold.axis = self.axis
         fold.angle = self.angle
-        fold.region_faces.clear()
 
-        for face_index in self.locked_region:
-            item = fold.region_faces.add()
-            item.index = face_index
+        region = fold.region
 
-        bm = bmesh.from_edit_mesh(self.me)
-        if self.locked_region is None:
-            raise RuntimeError("region_faces is None")
-        ensure_full_lookup_table(bm)
-
-        uv_layer = bm.loops.layers.uv.active
-
-        uv_accum = Vector((0.0, 0.0))
-        count = 0
-
-        for f_idx in self.locked_region:
-            f = bm.faces[f_idx]
-
-            for l in f.loops:
-                uv_accum += l[uv_layer].uv
-                count += 1
-
-        seed_face = next(iter(self.locked_region))
-        f = bm.faces[seed_face]
-
-        uv_accum = Vector((0, 0))
-        for l in f.loops:
-            uv_accum += l[uv_layer].uv
-
-        fold.seed_uv = uv_accum / len(f.loops)
-
-        fold.crease_uv_segments.clear()
-
-        for f_idx in self.locked_region:
-            f = bm.faces[f_idx]
-
-            for loop in f.loops:
-
-                edge = loop.edge
-
-                is_boundary = False
-
-                for linked_face in edge.link_faces:
-                    if linked_face.index not in self.locked_region:
-                        is_boundary = True
-                        break
-
-                if not is_boundary:
-                    continue
-
-                uv1 = loop[uv_layer].uv.copy()
-                uv2 = loop.link_loop_next[uv_layer].uv.copy()
-
-                seg = fold.crease_uv_segments.add()
-                seg.a = uv1
-                seg.b = uv2
-            
+        initialize_region_from_faces(
+            self.obj,
+            bm,
+            fold.region,
+            self.locked_region
+        )
                     
         self.obj.fold_timeline = self.obj.fold_timeline + 1
 
@@ -1925,6 +2438,8 @@ class ORIGAMI_OT_pick_side(Operator):
         self.obj.update_tag()
 
         HIGHLIGHT_FACES.clear()
+
+        check_new_overlapping_folds(self, context, group_index, len(group.folds)-1)
 
         self.finish(context)
 
@@ -2089,21 +2604,6 @@ class ORIGAMI_OT_drag_fold(Operator):
         self._faces_snapshot = [f.index for f in bm.faces]
         ensure_full_lookup_table(bm)
 
-        normal = self.compute_paper_normal(bm)
-
-        pivot, axis = self.crease_from_points(
-            self.start_vertex,
-            B,
-            normal
-        )
-
-        plane_normal = axis.cross(normal).normalized()
-
-        self._cached_plane = (pivot, plane_normal)
-
-        candidate_faces = [bm.faces[i] for i in self._faces_snapshot]
-
-
         start_vert = bm.verts[self.start_vertex_index]
 
         if not start_vert:
@@ -2118,6 +2618,23 @@ class ORIGAMI_OT_drag_fold(Operator):
             bm,
             seed_face
         )
+
+        n = Vector()
+
+        for f in candidate_faces:
+            n += f.normal
+
+        normal = n.normalized()
+
+        pivot, axis = self.crease_from_points(
+            self.start_vertex,
+            B,
+            normal
+        )
+
+        plane_normal = axis.cross(normal).normalized()
+
+        self._cached_plane = (pivot, plane_normal)
 
         self.preview_region = []
 
@@ -2350,13 +2867,25 @@ class ORIGAMI_OT_drag_fold(Operator):
         ensure_full_lookup_table(bm)
 
         threshold = 0.01 * self.obj.scale.length
-
-        apply_crease_path(
+        
+        new_verts = apply_crease_path(
             self._cached_bm,
             self._cached_path,
             threshold
         )
 
+        self._cached_bm.select_flush_mode()
+
+        self._cached_bm.select_history.clear()
+
+        for v in self._cached_bm.verts:
+            v.select = False
+
+        for v in new_verts:
+            if v.is_valid:
+                v.select = True
+
+        self._cached_bm.select_flush(True)
         bmesh.update_edit_mesh(self.me, loop_triangles=True, destructive=True)
 
         HIGHLIGHT_FACES.clear()
@@ -2380,6 +2909,40 @@ class ORIGAMI_OT_drag_fold(Operator):
     def finish(self, context):
         if hasattr(self, "_handle"):
             bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+
+class ORIGAMI_OT_set_basis(bpy.types.Operator):
+    bl_idname = "origami.petal_fold"
+    bl_label = "Make Petal Fold from Previous"
+
+    def execute(self, context):
+
+        obj = context.object
+        bm = bmesh.from_edit_mesh(obj.data)
+
+        ensure_full_lookup_table(bm)
+
+        f = bm.faces[0]
+
+        v0 = f.verts[0].co
+        v1 = f.verts[1].co
+        v3 = f.verts[-1].co
+
+        origin = f.calc_center_median()
+
+        x_axis = (v1 - v0)
+        y_axis = (v3 - v0)
+
+        obj["origami_basis_origin"] = list(origin)
+        obj["origami_basis_x"] = list(x_axis)
+        obj["origami_basis_y"] = list(y_axis)
+
+        self.report({'INFO'}, "Origami basis stored")
+        uv_layer = bm.loops.layers.uv.active
+        base_positions = base_positions_from_uv(obj, bm, uv_layer)
+        obj["origami_base_positions"] = [list(v) for v in base_positions]
+        FoldEvaluator.evaluate(obj, 0)
+        return {'FINISHED'}
+
 
 class ORIGAMI_OT_set_basis(bpy.types.Operator):
     bl_idname = "origami.set_basis"
@@ -2478,12 +3041,7 @@ class ORIGAMI_OT_fix_stuff(bpy.types.Operator):
         bm = bmesh.from_edit_mesh(obj.data)
         rebuild_regions_from_seed_uv(obj, bm)
         HIGHLIGHT_FACES.clear()
-        current_timeline = obj.fold_timeline
-        for index, group in enumerate(obj.fold_groups):
-            for rabbit_ear in group.rabbit_ears:
-                FoldEvaluator.evaluate(obj, index)
-                apply_rabbit_to_group(obj, bm, group, rabbit_ear.fold_a_index, rabbit_ear.fold_b_index)
-        FoldEvaluator.evaluate(obj, current_timeline)
+        clean_up_interactions(self, context)
         return{'FINISHED'}
 
 class ORIGAMI_OT_fold_delete(bpy.types.Operator):
@@ -2500,6 +3058,16 @@ class ORIGAMI_OT_fold_delete(bpy.types.Operator):
 
         if f < len(group.folds):
             fold = group.folds[f]
+            for other_fold in group.folds:
+                for i in range(len(other_fold.interactions) - 1, -1, -1):
+                    interaction = other_fold.interactions[i]
+
+                    if interaction.other_fold_index == f:
+                        other_fold.interactions.remove(i)
+
+                    elif interaction.other_fold_index > f:
+                        interaction.other_fold_index -= 1
+
             group.folds.remove(f)
             obj.active_fold = max(0, f - 1)
         if len(group.folds) == 0:
@@ -2509,24 +3077,22 @@ class ORIGAMI_OT_fold_delete(bpy.types.Operator):
         
         return {'FINISHED'}
 
-class ORIGAMI_OT_rabbit_delete(bpy.types.Operator):
-    bl_idname = "origami.rabbit_delete"
-    bl_label = "Delete Rabbit Ear"
 
-    def execute(self, context):
-        obj = context.object
-        groups = obj.fold_groups
-        g = obj.active_fold_group
-        r = obj.active_rabbit
+def copy_region(src_region, dst_region):
+    dst_region.region_name = src_region.region_name
+    dst_region.seed_uv = src_region.seed_uv
+    dst_region.cached_topology_version = (
+        src_region.cached_topology_version
+    )
 
-        group = obj.fold_groups[g]
+    for face in src_region.cached_faces:
+        item = dst_region.cached_faces.add()
+        item.index = face.index
 
-        if r < len(group.rabbit_ears):
-            rabbit = group.folds[r]
-            group.rabbit_ears.remove(r)
-            obj.active_rabbit = max(0, r - 1)
-        
-        return {'FINISHED'}
+    for seg in src_region.crease_uv_segments:
+        item = dst_region.crease_uv_segments.add()
+        item.a = seg.a
+        item.b = seg.b
 
 class ORIGAMI_OT_fold_move_up(bpy.types.Operator):
     bl_idname = "origami.fold_move_up"
@@ -2538,44 +3104,34 @@ class ORIGAMI_OT_fold_move_up(bpy.types.Operator):
         g = obj.active_fold_group
         f = obj.active_fold
 
-        group = obj.fold_groups[g]
+        if g <= 0:
+            return {'CANCELLED'}
 
-        if f <= 0:
-            if g <= 0:
-                return {'CANCELLED'}
+        src_group = obj.fold_groups[g]
+        dst_group = obj.fold_groups[g - 1]
 
-            src_group = obj.fold_groups[g]
-            dst_group = obj.fold_groups[g - 1]
+        if f >= len(src_group.folds):
+            return {'CANCELLED'}
 
-            if f >= len(src_group.folds):
-                return {'CANCELLED'}
+        fold = src_group.folds[f]
 
-            fold = src_group.folds[f]
+        new_fold = dst_group.folds.add()
 
-            new_fold = dst_group.folds.add()
+        for attr in ["pivot_3d", "axis", "angle"]:
+            setattr(new_fold, attr, getattr(fold, attr))
 
-            for attr in ["pivot_3d", "axis", "angle", "seed_uv"]:
-                setattr(new_fold, attr, getattr(fold, attr))
+        copy_region(
+            fold.region,
+            new_fold.region
+        )
 
-            for rf in fold.region_faces:
-                item = new_fold.region_faces.add()
-                item.index = rf.index
+        src_group.folds.remove(f)
 
-            for us in fold.crease_uv_segments:
-                item = new_fold.crease_uv_segments.add()
-                item.a = us.a
-                item.b = us.b
+        obj.active_fold_group = g - 1
+        obj.active_fold = len(dst_group.folds) - 1
+        clean_up_interactions(self, context)
 
-            src_group.folds.remove(f)
-
-            obj.active_fold_group = g - 1
-            obj.active_fold = len(dst_group.folds) - 1
-            return {'FINISHED'}
-
-        group.folds.move(f, f - 1)
-
-        obj.active_fold -= 1
-        obj.active_fold = max(obj.active_fold, 0)
+        check_new_overlapping_folds(self, context, g - 1, len(dst_group.folds)-1)
 
         return {'FINISHED'}
 
@@ -2591,44 +3147,37 @@ class ORIGAMI_OT_fold_move_down(bpy.types.Operator):
 
         group = obj.fold_groups[g]
 
-        if f >= len(group.folds) - 1:
-            if g >= len(obj.fold_groups) - 1:
-                obj.fold_groups.add()
+        if g >= len(obj.fold_groups) - 1:
+            obj.fold_groups.add()
 
-            src_group = obj.fold_groups[g]
-            dst_group = obj.fold_groups[g + 1]
+        src_group = obj.fold_groups[g]
+        dst_group = obj.fold_groups[g + 1]
 
-            if f >= len(src_group.folds):
-                return {'CANCELLED'}
+        if f >= len(src_group.folds):
+            return {'CANCELLED'}
 
-            fold = src_group.folds[f]
+        fold = src_group.folds[f]
 
-            new_fold = dst_group.folds.add()
+        new_fold = dst_group.folds.add()
 
-            for attr in ["pivot_3d", "axis", "angle", "seed_uv"]:
-                setattr(new_fold, attr, getattr(fold, attr))
+        for attr in ["pivot_3d", "axis", "angle"]:
+            setattr(new_fold, attr, getattr(fold, attr))
 
-            for rf in fold.region_faces:
-                item = new_fold.region_faces.add()
-                item.index = rf.index
+        copy_region(
+            fold.region,
+            new_fold.region
+        )
 
-            for us in fold.crease_uv_segments:
-                item = new_fold.crease_uv_segments.add()
-                item.a = us.a
-                item.b = us.b
+        src_group.folds.remove(f)
 
-            src_group.folds.remove(f)
+        obj.active_fold_group = g + 1
+        obj.active_fold = len(dst_group.folds) - 1
+        clean_up_interactions(self, context)
 
-            obj.active_fold_group = g + 1
-            obj.active_fold = len(dst_group.folds) - 1
-
-            return {'FINISHED'}
-
-        group.folds.move(f, f + 1)
-
-        obj.active_fold += 1
+        check_new_overlapping_folds(self, context, g + 1, len(dst_group.folds)-1)
 
         return {'FINISHED'}
+
 
 class ORIGAMI_OT_group_move_up(bpy.types.Operator):
     bl_idname = "origami.group_move_up"
@@ -2655,56 +3204,6 @@ class ORIGAMI_OT_group_move_down(bpy.types.Operator):
         if i < len(obj.fold_groups):
             obj.fold_groups.move(i, i + 1)
             obj.active_fold_group += 1
-
-        return {'FINISHED'}
-
-class ORIGAMI_OT_make_rabbit_ear(Operator):
-    bl_idname = "origami.make_rabbit_ear"
-    bl_label = "Tag As Rabbit Ear"
-
-    def execute(self, context):
-        obj = context.object
-        bm = bmesh.from_edit_mesh(obj.data)
-        ensure_full_lookup_table(bm)
-        group = obj.fold_groups[obj.active_fold_group]
-
-        selected = [i for i, fold in enumerate(group.folds) if fold.selected]
-
-        if len(selected) != 2:
-            print("Need exactly 2 selected folds")
-            return
-
-        foldA_index, foldB_index = selected
-
-        rebuild_regions_from_seed_uv(obj, bm)
-
-        FoldEvaluator.evaluate(obj, obj.active_fold_group)
-        apply_rabbit_to_group(obj, bm, group, foldA_index, foldB_index)
-
-        return {'FINISHED'}
-
-class ORIGAMI_OT_make_corner_fold(Operator):
-    bl_idname = "origami.make_corner_fold"
-    bl_label = "Tag As Corner Fold"
-
-    def execute(self, context):
-        obj = context.object
-        bm = bmesh.from_edit_mesh(obj.data)
-        ensure_full_lookup_table(bm)
-        group = obj.fold_groups[obj.active_fold_group]
-
-        selected = [i for i, fold in enumerate(group.folds) if fold.selected]
-
-        if len(selected) != 2:
-            print("Need exactly 2 selected folds")
-            return
-
-        foldA_index, foldB_index = selected
-
-        rebuild_regions_from_seed_uv(obj, bm)
-
-        FoldEvaluator.evaluate(obj, obj.active_fold_group)
-        apply_corner_fold_to_group(obj, bm, group, foldA_index, foldB_index)
 
         return {'FINISHED'}
 
@@ -2750,8 +3249,6 @@ class ORIGAMI_PT_fold_history_panel(Panel):
             row.operator("origami.fold_forward", text="Forward ▶")
             layout.operator("origami.fold_latest", text="⏩ Latest")
             if obj.active_fold_group < len(obj.fold_groups):
-                layout.operator("origami.make_rabbit_ear", text=f"Convert Selected Folds to Rabbit Ear")
-                layout.operator("origami.make_corner_fold", text=f"Convert Selected Folds to Corner Fold")
                 layout.operator("origami.flip_fold_axis", text=f"Flip Selected Folds Axis")
             
             row = layout.row()
@@ -2768,9 +3265,8 @@ class ORIGAMI_PT_fold_history_panel(Panel):
             col = row.column(align=True)
             col.operator("origami.group_move_up", icon='TRIA_UP', text="")
             col.operator("origami.group_move_down", icon='TRIA_DOWN', text="")
-
+            group = obj.fold_groups[obj.active_fold_group]
             if obj.fold_groups and obj.active_fold_group < len(obj.fold_groups):
-                group = obj.fold_groups[obj.active_fold_group]
                 layout.label(text="Folds")
                 row = layout.row()
                 row.template_list(
@@ -2788,28 +3284,36 @@ class ORIGAMI_PT_fold_history_panel(Panel):
                 col.operator("origami.fold_move_up", icon='TRIA_UP', text="")
                 col.operator("origami.fold_move_down", icon='TRIA_DOWN', text="")
 
-            if obj.fold_groups and obj.active_fold_group < len(obj.fold_groups) and len(obj.fold_groups[obj.active_fold_group].rabbit_ears) > 0:
-                group = obj.fold_groups[obj.active_fold_group]
-                layout.label(text="Rabbit Ears")
-                row = layout.row()
-                row.template_list(
-                    "ORIGAMI_UL_rabbit_ears",
-                    "",
-                    group,
-                    "rabbit_ears",
-                    obj,
-                    "active_rabbit",
-                    rows=6
-                )
+            if (group.folds and obj.active_fold < len(group.folds)):
+                active_fold = group.folds[obj.active_fold]
+                box = layout.box()
+                box.label(text="Fold Interactions")
+                interactions = interactions_for_fold(group, obj.active_fold)
+                for interaction in interactions:
 
-                col = row.column(align=True)
-                col.operator("origami.rabbit_delete", icon='X', text="")
+                    row = box.row()
 
+                    row.label(
+                        text=f"Fold {interaction.owner_fold_index if interaction.other_fold_index == obj.active_fold else interaction.other_fold_index}"
+                    )
+                    row.prop(
+                        interaction,
+                        "adjuster",
+                        text=""
+                    )
+                    row.prop(
+                        interaction,
+                        "interaction_type",
+                        text=""
+                    )
 
 def register():
     enable_uv_debug()
     bpy.utils.register_class(OrigamiFaceIndex)
     bpy.utils.register_class(OrigamiUVSegment)
+    bpy.utils.register_class(OrigamiAxis)
+    bpy.utils.register_class(OrigamiRegion)
+    bpy.utils.register_class(FoldInteraction)
     bpy.utils.register_class(OrigamiFold)
     bpy.utils.register_class(RabbitEar)
     bpy.utils.register_class(CornerFold)
@@ -2823,15 +3327,12 @@ def register():
     bpy.utils.register_class(ORIGAMI_OT_fix_stuff)
     bpy.utils.register_class(ORIGAMI_UL_fold_groups)
     bpy.utils.register_class(ORIGAMI_UL_folds)
-    bpy.utils.register_class(ORIGAMI_UL_rabbit_ears)
+    bpy.utils.register_class(ORIGAMI_UL_fold_interaction)
     bpy.utils.register_class(ORIGAMI_OT_fold_delete)
-    bpy.utils.register_class(ORIGAMI_OT_rabbit_delete)
     bpy.utils.register_class(ORIGAMI_OT_fold_move_up)
     bpy.utils.register_class(ORIGAMI_OT_fold_move_down)
     bpy.utils.register_class(ORIGAMI_OT_group_move_up)
     bpy.utils.register_class(ORIGAMI_OT_group_move_down)
-    bpy.utils.register_class(ORIGAMI_OT_make_rabbit_ear)
-    bpy.utils.register_class(ORIGAMI_OT_make_corner_fold)
     bpy.utils.register_class(ORIGAMI_OT_flip_axis)
 
     bpy.utils.register_class(ORIGAMI_OT_fold_back)
@@ -2883,20 +3384,20 @@ def unregister():
     disable_uv_debug()
     bpy.utils.unregister_class(OrigamiFaceIndex)
     bpy.utils.unregister_class(OrigamiUVSegment)
+    bpy.utils.unregister_class(OrigamiAxis)
+    bpy.utils.unregister_class(OrigamiRegion)
+    bpy.utils.unregister_class(FoldInteraction)
     bpy.utils.unregister_class(ORIGAMI_PT_fold_history_panel)
 
     bpy.utils.unregister_class(ORIGAMI_OT_fix_stuff)
     bpy.utils.unregister_class(ORIGAMI_UL_fold_groups)
     bpy.utils.unregister_class(ORIGAMI_UL_folds)
-    bpy.utils.register_class(ORIGAMI_UL_rabbit_ears)
+    bpy.utils.unregister_class(ORIGAMI_UL_fold_interaction)
     bpy.utils.unregister_class(ORIGAMI_OT_fold_delete)
-    bpy.utils.unregister_class(ORIGAMI_OT_rabbit_delete)
     bpy.utils.unregister_class(ORIGAMI_OT_fold_move_up)
     bpy.utils.unregister_class(ORIGAMI_OT_fold_move_down)
     bpy.utils.unregister_class(ORIGAMI_OT_group_move_up)
     bpy.utils.unregister_class(ORIGAMI_OT_group_move_down)
-    bpy.utils.unregister_class(ORIGAMI_OT_make_rabbit_ear)
-    bpy.utils.unregister_class(ORIGAMI_OT_make_corner_fold)
     bpy.utils.unregister_class(ORIGAMI_OT_flip_axis)
 
     bpy.utils.unregister_class(ORIGAMI_PT_panel)
@@ -2928,7 +3429,6 @@ def unregister():
         bpy.app.handlers.undo_post.remove(undo_post_handler)
 
 def remove_draw_handlers():
-    print(len(DRAW_HANDLERS))
     for h in DRAW_HANDLERS:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')

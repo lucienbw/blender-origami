@@ -1,10 +1,14 @@
 import bpy
 import gpu
+import colorsys
+import math
 from mathutils import Vector
 from gpu_extras.batch import batch_for_shader
 
 from .origami_state import DEBUG_UV_SEGMENTS
+from .origami_state import INTERACTION_UV_SEGMENT_LISTS
 from .origami_state import DEBUG_BLOCKED_EDGES
+from .origami_state import DEBUG_FLOODS
 from .origami_state import DEBUG_TESTED_EDGES
 from .origami_state import DEBUG_CORNER_POINTS
 
@@ -132,10 +136,7 @@ def draw_uv_debug():
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    # -------------------------
-    # STORED CREASE SEGMENTS
-    # GREEN
-    # -------------------------
+    # Normal Fold Rendering
 
     coords = []
 
@@ -155,37 +156,11 @@ def draw_uv_debug():
 
         batch.draw(shader)
 
-    # -------------------------
-    # TESTED EDGES
-    # BLUE
-    # -------------------------
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    coords = []
-
+    # Leak Finder
+    coords = [] 
     for a, b in DEBUG_TESTED_EDGES:
-        coords.extend([a, b])
-
-    if coords:
-
-        batch = batch_for_shader(
-            shader,
-            'LINES',
-            {"pos": coords}
-        )
-
-        shader.bind()
-        shader.uniform_float("color", (0, 0, 1, 0.3))
-
-        batch.draw(shader)
-
-    # -------------------------
-    # BLOCKED EDGES
-    # RED
-    # -------------------------
-
-    coords = []
-
-    for a, b in DEBUG_BLOCKED_EDGES:
         coords.extend([a, b])
 
     if coords:
@@ -201,22 +176,36 @@ def draw_uv_debug():
 
         batch.draw(shader)
 
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    # Corner
-    for pos, color in DEBUG_CORNER_POINTS:
+    # Interaction Fold Rendering
+    colors = get_evenly_spaced_colors(len(INTERACTION_UV_SEGMENT_LISTS))
+    for index, segments in enumerate(INTERACTION_UV_SEGMENT_LISTS):
+        coords = []
+        for a, b in segments:
+            coords.extend([a, b])
 
-        batch = batch_for_shader(
-            shader,
-            'POINTS',
-            {"pos": [pos]}
-        )
+        if coords:
 
-        gpu.state.point_size_set(8)
+            batch = batch_for_shader(
+                shader,
+                'LINES',
+                {"pos": coords}
+            )
 
-        shader.bind()
-        shader.uniform_float("color", color)
+            shader.bind()
+            shader.uniform_float("color", colors[index])
+            gpu.state.line_width_set(len(INTERACTION_UV_SEGMENT_LISTS)*2 - (index*2))
+            batch.draw(shader)
 
-        batch.draw(shader)
+def get_evenly_spaced_colors(n):
+    colors = []
+    for i in range(n):
+        hue = i / n
+        rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        rgba = (rgb[0], rgb[1], rgb[2], 1)
+        colors.append(rgba)
+    return colors
 
 
 def draw_crease_pattern():

@@ -10,19 +10,21 @@ import importlib
 
 # --- Import modules ---
 if "bpy" in locals():
-    importlib.reload(origami_main)
-    importlib.reload(origami_crease_visualizer)
     importlib.reload(origami_state)
+    importlib.reload(origami_crease_visualizer)
+    importlib.reload(origami_main)
 else:
-    from . import origami_main
-    from . import origami_crease_visualizer
     from . import origami_state
+    from . import origami_crease_visualizer
+    from . import origami_main
+    
+
 
 # List of modules for easy register/unregister
 modules = [
-    origami_main,
-    origami_crease_visualizer,
     origami_state,
+    origami_crease_visualizer,
+    origami_main,
 ]
 
 
