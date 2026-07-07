@@ -186,8 +186,6 @@ class CornerFold(PropertyGroup):
 class OrigamiFoldGroup(PropertyGroup):
     name: bpy.props.StringProperty(default="Fold Group")
     folds: CollectionProperty(type=OrigamiFold)
-    rabbit_ears: CollectionProperty(type=RabbitEar)
-    corner_folds: CollectionProperty(type=CornerFold)
 
 class PreviewFold:
     def __init__(self, pivot_3d, axis, angle, region_faces):
@@ -2910,39 +2908,35 @@ class ORIGAMI_OT_drag_fold(Operator):
         if hasattr(self, "_handle"):
             bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
 
-class ORIGAMI_OT_set_basis(bpy.types.Operator):
-    bl_idname = "origami.petal_fold"
-    bl_label = "Make Petal Fold from Previous"
+class ORIGAMI_OT_update_fold_axis(Operator):
+    bl_idname = "origami.update_fold_axis"
+    bl_label = "Update Fold Axis"
+    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-
+        
         obj = context.object
+
         bm = bmesh.from_edit_mesh(obj.data)
 
+        self.edge = next((_edge for _edge in reversed(bm.select_history) if isinstance(_edge, bmesh.types.BMEdge)), None)
+        if not self.edge:
+            return
+        
         ensure_full_lookup_table(bm)
+        self.crease_edge_ids = {e.index for e in bm.edges if e.select}
 
-        f = bm.faces[0]
+        v1, v2 = self.edge.verts
 
-        v0 = f.verts[0].co
-        v1 = f.verts[1].co
-        v3 = f.verts[-1].co
+        self.pivot_3d = (v1.co + v2.co) * 0.5
+        self.axis = (v2.co - v1.co).normalized()
 
-        origin = f.calc_center_median()
+        group = obj.fold_groups[obj.active_fold_group]
+        fold = group.folds[obj.active_fold]
 
-        x_axis = (v1 - v0)
-        y_axis = (v3 - v0)
-
-        obj["origami_basis_origin"] = list(origin)
-        obj["origami_basis_x"] = list(x_axis)
-        obj["origami_basis_y"] = list(y_axis)
-
-        self.report({'INFO'}, "Origami basis stored")
-        uv_layer = bm.loops.layers.uv.active
-        base_positions = base_positions_from_uv(obj, bm, uv_layer)
-        obj["origami_base_positions"] = [list(v) for v in base_positions]
-        FoldEvaluator.evaluate(obj, 0)
+        fold.pivot_3d = self.pivot_3d
+        fold.axis = self.axis
         return {'FINISHED'}
-
 
 class ORIGAMI_OT_set_basis(bpy.types.Operator):
     bl_idname = "origami.set_basis"
@@ -3028,6 +3022,7 @@ class ORIGAMI_PT_panel(Panel):
 
         layout.operator("origami.pick_side", text="Make New Fold")
         layout.operator("origami.drag_fold", text="Drag Corner Fold")
+        layout.operator("origami.update_fold_axis", text="Update Fold Axis")
         layout.operator("origami.fix_stuff", text="Fix Broken Stuff")
         layout.prop(obj, "base_axis", slider=True)
         layout.operator("origami.set_basis", text="Set New Base Axis Rotation")
@@ -3077,7 +3072,6 @@ class ORIGAMI_OT_fold_delete(bpy.types.Operator):
         
         return {'FINISHED'}
 
-
 def copy_region(src_region, dst_region):
     dst_region.region_name = src_region.region_name
     dst_region.seed_uv = src_region.seed_uv
@@ -3107,7 +3101,14 @@ class ORIGAMI_OT_fold_move_up(bpy.types.Operator):
         if g <= 0:
             return {'CANCELLED'}
 
-        src_group = obj.fold_groups[g]
+        group = obj.fold_groups[g]
+
+        if f > 0:
+            group.folds.move(f, f - 1)
+            obj.active_fold -= 1
+            return {'FINISHED'}
+
+        src_group = group
         dst_group = obj.fold_groups[g - 1]
 
         if f >= len(src_group.folds):
@@ -3147,10 +3148,15 @@ class ORIGAMI_OT_fold_move_down(bpy.types.Operator):
 
         group = obj.fold_groups[g]
 
+        if f < len(group.folds) - 1:
+            group.folds.move(f, f + 1)
+            obj.active_fold += 1
+            return {'FINISHED'}
+
         if g >= len(obj.fold_groups) - 1:
             obj.fold_groups.add()
 
-        src_group = obj.fold_groups[g]
+        src_group = group
         dst_group = obj.fold_groups[g + 1]
 
         if f >= len(src_group.folds):
@@ -3177,7 +3183,6 @@ class ORIGAMI_OT_fold_move_down(bpy.types.Operator):
         check_new_overlapping_folds(self, context, g + 1, len(dst_group.folds)-1)
 
         return {'FINISHED'}
-
 
 class ORIGAMI_OT_group_move_up(bpy.types.Operator):
     bl_idname = "origami.group_move_up"
@@ -3320,6 +3325,7 @@ def register():
     bpy.utils.register_class(OrigamiFoldGroup)
     bpy.utils.register_class(ORIGAMI_OT_pick_side)
     bpy.utils.register_class(ORIGAMI_OT_drag_fold)
+    bpy.utils.register_class(ORIGAMI_OT_update_fold_axis)
     bpy.utils.register_class(ORIGAMI_OT_set_basis)
     bpy.utils.register_class(ORIGAMI_PT_panel)
     bpy.utils.register_class(ORIGAMI_PT_fold_history_panel)
@@ -3403,6 +3409,7 @@ def unregister():
     bpy.utils.unregister_class(ORIGAMI_PT_panel)
     bpy.utils.unregister_class(ORIGAMI_OT_pick_side)
     bpy.utils.unregister_class(ORIGAMI_OT_drag_fold)
+    bpy.utils.unregister_class(ORIGAMI_OT_update_fold_axis)
     bpy.utils.unregister_class(ORIGAMI_OT_set_basis)
     bpy.utils.unregister_class(OrigamiFold)
     bpy.utils.unregister_class(OrigamiFoldGroup)
