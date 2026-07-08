@@ -65,8 +65,6 @@ class OrigamiRegion(PropertyGroup):
         type=OrigamiUVSegment
     )
 
-    cached_topology_version: IntProperty(default=-1)
-
     cached_faces: CollectionProperty(
         type=OrigamiFaceIndex
     )
@@ -122,6 +120,7 @@ class FoldInteraction(PropertyGroup):
 class OrigamiFold(PropertyGroup):
     pivot_3d: FloatVectorProperty(size=3)
     axis: FloatVectorProperty(size=3)
+    uv_axis: PointerProperty(type=OrigamiUVSegment)
     angle: bpy.props.FloatProperty(
         name="Angle",
         subtype='ANGLE',
@@ -1793,8 +1792,6 @@ def rabbit_ear_eval(group, interaction, t, bm):
         adjustmentAngle * t
     )
 
-    print(Vector(interaction.axes[2].value))
-
     return {
         "a_base_faces": A,
         "b_base_faces": B, 
@@ -2071,6 +2068,85 @@ def flood_region(start_face, adjacency):
 
     return visited
 
+def barycentric_coords_2d(p, a, b, c):
+
+    v0 = b - a
+    v1 = c - a
+    v2 = p - a
+
+    d00 = v0.dot(v0)
+    d01 = v0.dot(v1)
+    d11 = v1.dot(v1)
+    d20 = v2.dot(v0)
+    d21 = v2.dot(v1)
+
+    denom = d00 * d11 - d01 * d01
+    if abs(denom) < 1e-12:
+        return None
+
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+
+    return u, v, w
+
+def uv_to_3d(bm, uv_layer, uv_point, candidate_faces=None, epsilon=1e-6):
+
+    if candidate_faces is None:
+        faces = bm.faces
+    else:
+        faces = [
+            bm.faces[f] if isinstance(f, int) else f
+            for f in candidate_faces
+        ]
+
+    for face in faces:
+
+        loops = face.loops
+
+        if len(loops) < 3:
+            continue
+
+        # Fan triangulation about vertex 0
+        for i in range(1, len(loops) - 1):
+
+            l0 = loops[0]
+            l1 = loops[i]
+            l2 = loops[i + 1]
+
+            uv0 = Vector(l0[uv_layer].uv)
+            uv1 = Vector(l1[uv_layer].uv)
+            uv2 = Vector(l2[uv_layer].uv)
+
+            bary = barycentric_coords_2d(
+                uv_point,
+                uv0,
+                uv1,
+                uv2
+            )
+
+            if bary is None:
+                continue
+
+            u, v, w = bary
+
+            if (
+                u >= -epsilon and
+                v >= -epsilon and
+                w >= -epsilon
+            ):
+                p0 = l0.vert.co
+                p1 = l1.vert.co
+                p2 = l2.vert.co
+
+                return (
+                    u * p0 +
+                    v * p1 +
+                    w * p2
+                )
+
+    return None
+
 def fold_matrix(pivot, axis, angle):
     rot = Matrix.Rotation(angle, 4, axis)
     return Matrix.Translation(pivot) @ rot @ Matrix.Translation(-pivot)
@@ -2198,7 +2274,6 @@ class FoldEvaluator:
             bm.free()
 
         me.update()
-        bpy.context.view_layer.update()
 
 def draw_callback(_self):
     context = bpy.context
@@ -2292,6 +2367,16 @@ class ORIGAMI_OT_pick_side(Operator):
 
         self.pivot_3d = (v1.co + v2.co) * 0.5
         self.axis = (v2.co - v1.co).normalized()
+
+        uv_layer = bm.loops.layers.uv.active
+
+        for loop in self.edge.link_loops:
+            uv0 = loop[uv_layer].uv.copy()
+            uv1 = loop.link_loop_next[uv_layer].uv.copy()
+
+            self.crease_uv_a = uv0
+            self.crease_uv_b = uv1
+            break
 
     def modal(self, context, event):
         if self.state == 'PICK_SIDE':
@@ -2416,6 +2501,10 @@ class ORIGAMI_OT_pick_side(Operator):
 
         fold.pivot_3d = self.pivot_3d
         fold.axis = self.axis
+
+        fold.uv_axis.a = self.crease_uv_a
+        fold.uv_axis.b = self.crease_uv_b
+
         fold.angle = self.angle
 
         region = fold.region
@@ -2935,9 +3024,87 @@ class ORIGAMI_OT_update_fold_axis(Operator):
         fold = group.folds[obj.active_fold]
 
         fold.pivot_3d = self.pivot_3d
-        fold.axis = self.axis
+
+        uv_layer = bm.loops.layers.uv.active
+
+        loop = self.edge.link_loops[0]
+
+        uv0 = loop[uv_layer].uv
+        uv1 = loop.link_loop_next[uv_layer].uv
+
+        if Vector(fold.axis).dot(Vector(self.axis)) > 0:
+
+            fold.axis = self.axis
+
+            fold.uv_axis.a = uv0
+            fold.uv_axis.b = uv1
+        else:
+            fold.axis = self.axis * -1
+
+            fold.uv_axis.a = uv1
+            fold.uv_axis.b = uv0
+
+
         return {'FINISHED'}
 
+class ORIGAMI_OT_update_fold_axes_from_uv(Operator):
+    bl_idname = "origami.update_fold_axes_from_uv"
+    bl_label = "Update Fold Axes From UV"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+
+        obj = context.object
+        me = obj.data
+
+        bm = bmesh.from_edit_mesh(me)
+
+        ensure_full_lookup_table(bm)
+
+        uv_layer = bm.loops.layers.uv.active
+        if uv_layer is None:
+            self.report({'ERROR'}, "Mesh has no UV map.")
+            return {'CANCELLED'}
+
+        for gid, group in enumerate(obj.fold_groups):
+            FoldEvaluator.evaluate(obj, gid)
+            for fold in group.folds:
+
+                segment = fold.uv_axis
+
+                p0 = uv_to_3d(
+                    bm,
+                    uv_layer,
+                    Vector(segment.a)
+                )
+
+                p1 = uv_to_3d(
+                    bm,
+                    uv_layer,
+                    Vector(segment.b)
+                )
+
+                if p0 is None or p1 is None:
+                    self.report(
+                        {'WARNING'},
+                        f"Could not reconstruct fold '{group.name}'."
+                    )
+                    continue
+
+                new_axis = (p1 - p0)
+                
+                if Vector(fold.axis).dot(new_axis) > 0:
+                    fold.axis = new_axis
+                else:
+                    fold.axis = new_axis * -1
+
+                fold.pivot_3d = (p0 + p1) * 0.5
+
+        bmesh.update_edit_mesh(me, loop_triangles=False)
+
+        self.report({'INFO'}, "Updated fold axes from UV.")
+        return {'FINISHED'}
+    
 class ORIGAMI_OT_set_basis(bpy.types.Operator):
     bl_idname = "origami.set_basis"
     bl_label = "Set Origami Basis"
@@ -3023,6 +3190,7 @@ class ORIGAMI_PT_panel(Panel):
         layout.operator("origami.pick_side", text="Make New Fold")
         layout.operator("origami.drag_fold", text="Drag Corner Fold")
         layout.operator("origami.update_fold_axis", text="Update Fold Axis")
+        layout.operator("origami.update_fold_axes_from_uv", text="Update All Axes From UV")
         layout.operator("origami.fix_stuff", text="Fix Broken Stuff")
         layout.prop(obj, "base_axis", slider=True)
         layout.operator("origami.set_basis", text="Set New Base Axis Rotation")
@@ -3075,9 +3243,6 @@ class ORIGAMI_OT_fold_delete(bpy.types.Operator):
 def copy_region(src_region, dst_region):
     dst_region.region_name = src_region.region_name
     dst_region.seed_uv = src_region.seed_uv
-    dst_region.cached_topology_version = (
-        src_region.cached_topology_version
-    )
 
     for face in src_region.cached_faces:
         item = dst_region.cached_faces.add()
@@ -3098,15 +3263,15 @@ class ORIGAMI_OT_fold_move_up(bpy.types.Operator):
         g = obj.active_fold_group
         f = obj.active_fold
 
-        if g <= 0:
-            return {'CANCELLED'}
-
         group = obj.fold_groups[g]
 
         if f > 0:
             group.folds.move(f, f - 1)
             obj.active_fold -= 1
             return {'FINISHED'}
+
+        if g <= 0:
+            return {'CANCELLED'}
 
         src_group = group
         dst_group = obj.fold_groups[g - 1]
@@ -3326,6 +3491,7 @@ def register():
     bpy.utils.register_class(ORIGAMI_OT_pick_side)
     bpy.utils.register_class(ORIGAMI_OT_drag_fold)
     bpy.utils.register_class(ORIGAMI_OT_update_fold_axis)
+    bpy.utils.register_class(ORIGAMI_OT_update_fold_axes_from_uv)
     bpy.utils.register_class(ORIGAMI_OT_set_basis)
     bpy.utils.register_class(ORIGAMI_PT_panel)
     bpy.utils.register_class(ORIGAMI_PT_fold_history_panel)
@@ -3410,6 +3576,7 @@ def unregister():
     bpy.utils.unregister_class(ORIGAMI_OT_pick_side)
     bpy.utils.unregister_class(ORIGAMI_OT_drag_fold)
     bpy.utils.unregister_class(ORIGAMI_OT_update_fold_axis)
+    bpy.utils.unregister_class(ORIGAMI_OT_update_fold_axes_from_uv)
     bpy.utils.unregister_class(ORIGAMI_OT_set_basis)
     bpy.utils.unregister_class(OrigamiFold)
     bpy.utils.unregister_class(OrigamiFoldGroup)
