@@ -1,5 +1,5 @@
 bl_info = {
-    "name": "Origami Addon",
+    "name": "Blender-Origami",
     "author": "You",
     "version": (1, 0, 0),
     "blender": (4, 0, 0),

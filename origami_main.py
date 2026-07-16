@@ -7,6 +7,7 @@ import json
 import bpy
 import numpy as np
 
+from bpy.app.handlers import persistent
 from bpy.types import PropertyGroup, Panel, Operator
 from bpy.props import FloatProperty, FloatVectorProperty, CollectionProperty, IntProperty, PointerProperty, EnumProperty, BoolProperty
 from mathutils import Vector, Matrix
@@ -65,14 +66,16 @@ class OrigamiRegion(PropertyGroup):
     )
 
     def get_cached_faces(self):
-        return REGION_FACE_CACHE[self.as_pointer()]
+        faces = REGION_FACE_CACHE.get(self.as_pointer())
+        if faces == None:
+            faces = set()
+        return faces
 
     def set_cached_faces(self, new_faces):
         REGION_FACE_CACHE[self.as_pointer()] = new_faces
 
     def clear_cached_faces(self):
         REGION_FACE_CACHE[self.as_pointer()] = []
-
 
 class OrigamiAxis(PropertyGroup):
     value: FloatVectorProperty(size=3)
@@ -200,11 +203,18 @@ class ORIGAMI_UL_folds(bpy.types.UIList):
         )
 
         split = row.split(factor=0.6)
+        faces = fold.region.get_cached_faces()
 
-        split.label(
-            text=f"{len(fold.region.get_cached_faces())} faces",
-            icon='MOD_SIMPLEDEFORM'
-        )
+        if faces is not None:
+            split.label(
+                text=f"{len(faces)} faces",
+                icon='MOD_SIMPLEDEFORM'
+            )
+        else:
+            split.label(
+                text="No cache",
+                icon='MOD_SIMPLEDEFORM'
+            )
 
         split.prop(
             fold,
@@ -296,12 +306,13 @@ def delayed_cache_init():
     initialize_cached_faces_for_scene()
     return None
 
+@persistent
 def origami_load_post(_dummy):
     bpy.app.timers.register(
         delayed_cache_init,
         first_interval=1.0
     )
-
+@persistent
 def undo_post_handler(dummy):
     for obj in bpy.data.objects:
         if hasattr(obj, "fold_timeline"):
@@ -317,22 +328,12 @@ def clean_up_interactions(self, context):
                 if interaction.other_fold_index >= len(group.folds):
                     fold.interactions.remove(i)
 
-def dump_origami_state(obj):
-    print("\nOBJECT:", obj.name)
-    print("Custom properties:")
-    for k in obj.keys():
-        print(" ", k, "=", obj[k])
-
-    print("fold groups:", len(obj.fold_groups))
-    print("base positions:", len(obj.get("origami_base_positions", [])))
-
 def on_active_fold_changed(self, context):
     ensure_draw_handler()
     obj = context.object
 
     if not obj:
         return
-    dump_origami_state(obj)
     HIGHLIGHT_FACES.clear()
     DEBUG_UV_SEGMENTS.clear()
     DEBUG_TESTED_EDGES.clear()
@@ -573,6 +574,14 @@ def build_group_operations(obj, bm, group, partial, preview_fold=None):
 
                     operations.extend([
                         FoldOperation(
+                            interaction.get_region("base_faces_a").get_cached_faces(),
+                            evals["a_base_faces"]
+                        ),
+                        FoldOperation(
+                            interaction.get_region("base_faces_b").get_cached_faces(),
+                            evals["b_base_faces"]
+                        ),
+                        FoldOperation(
                             interaction.get_region("corner_faces_a").get_cached_faces(),
                             evals["a_corner_faces"]
                         ),
@@ -592,7 +601,15 @@ def build_group_operations(obj, bm, group, partial, preview_fold=None):
                     )
 
                     operations.extend([
-
+                        
+                        FoldOperation(
+                            interaction.get_region("base_A").get_cached_faces(),
+                            evals["a_base_faces"]
+                        ),
+                        FoldOperation(
+                            interaction.get_region("base_B").get_cached_faces(),
+                            evals["b_base_faces"]
+                        ),
                         FoldOperation(
                             interaction.get_region("tip_A").get_cached_faces(),
                             evals["a_tip_faces"]
@@ -665,15 +682,18 @@ def find_interaction(group, owner_index, other_index):
     for interaction in group.folds[owner_index].interactions:
         if interaction.other_fold_index == other_index:
             return interaction
-
+    for interaction in group.folds[other_index].interactions:
+        if interaction.owner_fold_index == owner_index:
+            return interaction
     return None
 
 def ensure_interaction(group, owner_index, other_index):
     interaction = find_interaction(group, owner_index, other_index)
 
     if interaction:
+        print("Found existing interaction")
         return interaction
-
+    print("Nope")
     interaction = group.folds[owner_index].interactions.add()
     interaction.owner_fold_index = owner_index
     interaction.other_fold_index = other_index
@@ -724,12 +744,28 @@ def shares_face(fold_a, fold_b):
 
     return not faces_a.isdisjoint(faces_b)
 
+def reset_interactions(self, context, group_index):
+    clear_interactions(self, context, group_index)
+    obj = context.object
+    group = obj.fold_groups[group_index]
+    for f, fold in enumerate(group.folds):
+        check_new_overlapping_folds(self, context, group_index, f)
+        
+def clear_interactions(self, context, group_index):
+    obj = context.object
+    group = obj.fold_groups[group_index]
+    for f, fold in enumerate(group.folds):
+        for i in range(len(fold.interactions) - 1, -1, -1):
+            interaction = fold.interactions[i]
+            fold.interactions.remove(i)
+                
+                
 def check_new_overlapping_folds(self, context, group_index, new_fold_index):
     obj = context.object
     group = obj.fold_groups[group_index]
     new_fold = group.folds[new_fold_index]
     for index, fold in enumerate(group.folds):
-        if index != new_fold_index:
+        if index < new_fold_index:
             if (shares_face(fold, new_fold)):
                 ensure_interaction(group, index, new_fold_index)
 
@@ -766,12 +802,12 @@ def edge_lies_on_crease(e1, e2, crease_segments):
     def project_scalar(p, origin, direction):
         return (p - origin).dot(direction)
 
-    ANGLE_EPS = 0.95
+    ANGLE_EPS = 0.98
 
     edge_dir = (e2 - e1)
     edge_len = edge_dir.length
 
-    DIST_EPS = 0.05 * edge_len
+    DIST_EPS = 0.01 * edge_len
 
     if edge_len < 1e-8:
         return False
@@ -990,6 +1026,7 @@ def closest_point_between_lines(p1, d1, p2, d2):
 
     return (c1 + c2) * 0.5
 
+@persistent
 def depsgraph_handler(scene, depsgraph):
     for update in depsgraph.updates:
         obj = update.id.original
@@ -1014,6 +1051,7 @@ def depsgraph_handler(scene, depsgraph):
             obj["_topo_face_len"] = len(bm.faces)
             rebuild_regions_from_seed_uv(obj, bm)
 
+@persistent
 def origami_frame_update(scene):
     for obj in scene.objects:
 
@@ -1394,6 +1432,7 @@ def build_corner_interaction_data(obj, bm, group, interaction):
     if axisA.dot(axisB) > 0:
         axisB = -axisB
 
+    interaction.axes.clear()
     new_axisA = interaction.axes.add()
     new_axisA.value = axisA
     new_axisB = interaction.axes.add()
@@ -1431,8 +1470,10 @@ def build_collapse_interaction_data(obj, bm, group, interaction):
     facesA = foldA.region.get_cached_faces()
     facesB = foldB.region.get_cached_faces()
 
-    first_face_index = facesA[0]
-    paper_normal = bm.faces[first_face_index].normal
+    paper_normal = Vector((0.0, 0.0, 0.0))
+    for face in facesA:
+        paper_normal += bm.faces[face].normal
+    paper_normal.normalize()
 
     overlap = facesA & facesB
     total_faces = facesA | facesB
@@ -1563,8 +1604,10 @@ def build_rabbit_interaction_data(obj, bm, group, interaction, cut):
     facesA = foldA.region.get_cached_faces()
     facesB = foldB.region.get_cached_faces()
 
-    first_face_index = facesA[0]
-    paper_normal = bm.faces[first_face_index].normal
+    paper_normal = Vector((0.0, 0.0, 0.0))
+    for face in facesA:
+        paper_normal += bm.faces[face].normal
+    paper_normal.normalize()
 
     overlap = facesA & facesB
     total_faces = facesA | facesB
@@ -2128,7 +2171,7 @@ class FoldEvaluator:
                     obj,
                     bm,
                     group,
-                    partial if gi == full else 1.0,
+                    1,
                     preview_fold,
                 )
             else:
@@ -2967,6 +3010,7 @@ class ORIGAMI_OT_update_fold_axis(Operator):
 class ORIGAMI_OT_update_fold_axes_from_uv(Operator):
     bl_idname = "origami.update_fold_axes_from_uv"
     bl_label = "Update Fold Axes From UV"
+    bl_description = "This feature is still under development."
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -3008,8 +3052,10 @@ class ORIGAMI_OT_update_fold_axes_from_uv(Operator):
                     )
                     continue
 
-                new_axis = (p1 - p0)
-                
+                new_axis = (p1 - p0).normalized()
+                if new_axis.length < 1e-6:
+                    self.report({'WARNING'}, f"Fold '{group.name}' has zero-length axis.")
+                    continue
                 if Vector(fold.axis).dot(new_axis) > 0:
                     fold.axis = new_axis
                 else:
@@ -3107,7 +3153,9 @@ class ORIGAMI_PT_panel(Panel):
         layout.operator("origami.pick_side", text="Make New Fold")
         layout.operator("origami.drag_fold", text="Drag Corner Fold")
         layout.operator("origami.update_fold_axis", text="Update Fold Axis")
-        layout.operator("origami.update_fold_axes_from_uv", text="Update All Axes From UV")
+        row = layout.row()
+        row.enabled = False
+        row.operator("origami.update_fold_axes_from_uv", text="Update All Axes From UV")
         layout.operator("origami.fix_stuff", text="Fix Broken Stuff")
         layout.prop(obj, "base_axis", slider=True)
         layout.operator("origami.set_basis", text="Set New Base Axis Rotation")
@@ -3292,24 +3340,14 @@ class ORIGAMI_OT_group_move_down(bpy.types.Operator):
 
         return {'FINISHED'}
 
-class ORIGAMI_OT_flip_axis(Operator):
-    bl_idname = "origami.flip_fold_axis"
-    bl_label = "Flip the Axis of a Fold"
+class ORIGAMI_OT_reset_group_interactions(Operator):
+    bl_idname = "origami.reset_group_interactions"
+    bl_label = "Reset The Interactions of a Group"
 
     def execute(self, context):
         obj = context.object
-        bm = bmesh.from_edit_mesh(obj.data)
-        ensure_full_lookup_table(bm)
-        group = obj.fold_groups[obj.active_fold_group]
-
-        for fold in group.folds:
-            if fold.selected:
-                fold.axis = (
-                    -fold.axis[0],
-                    -fold.axis[1],
-                    -fold.axis[2]
-                )
-                fold.angle = -fold.angle
+        group_index = obj.active_fold_group
+        reset_interactions(self, context, group_index)
 
         return {'FINISHED'}
 
@@ -3333,8 +3371,6 @@ class ORIGAMI_PT_fold_history_panel(Panel):
             row.operator("origami.fold_back", text="◀ Back")
             row.operator("origami.fold_forward", text="Forward ▶")
             layout.operator("origami.fold_latest", text="⏩ Latest")
-            if obj.active_fold_group < len(obj.fold_groups):
-                layout.operator("origami.flip_fold_axis", text=f"Flip Selected Folds Axis")
             
             row = layout.row()
             row.template_list(
@@ -3353,6 +3389,8 @@ class ORIGAMI_PT_fold_history_panel(Panel):
             group = obj.fold_groups[obj.active_fold_group]
             if obj.fold_groups and obj.active_fold_group < len(obj.fold_groups):
                 layout.label(text="Folds")
+                if obj.active_fold_group < len(obj.fold_groups):
+                    layout.operator("origami.reset_group_interactions", text=f"Reset Group Interactions")
                 row = layout.row()
                 row.template_list(
                     "ORIGAMI_UL_folds",
@@ -3417,7 +3455,7 @@ def register():
     bpy.utils.register_class(ORIGAMI_OT_fold_move_down)
     bpy.utils.register_class(ORIGAMI_OT_group_move_up)
     bpy.utils.register_class(ORIGAMI_OT_group_move_down)
-    bpy.utils.register_class(ORIGAMI_OT_flip_axis)
+    bpy.utils.register_class(ORIGAMI_OT_reset_group_interactions)
 
     bpy.utils.register_class(ORIGAMI_OT_fold_back)
     bpy.utils.register_class(ORIGAMI_OT_fold_forward)
@@ -3458,8 +3496,7 @@ def register():
         bpy.app.handlers.load_post.append(origami_load_post)
 
     ensure_draw_handler()
-    bpy.app.timers.register(delayed_cache_init, first_interval=1.0)
-
+    bpy.app.timers.register(delayed_cache_init, first_interval=0.25)
 
 def ensure_draw_handler():
     if not DRAW_HANDLERS:
@@ -3485,7 +3522,7 @@ def unregister():
     bpy.utils.unregister_class(ORIGAMI_OT_fold_move_down)
     bpy.utils.unregister_class(ORIGAMI_OT_group_move_up)
     bpy.utils.unregister_class(ORIGAMI_OT_group_move_down)
-    bpy.utils.unregister_class(ORIGAMI_OT_flip_axis)
+    bpy.utils.unregister_class(ORIGAMI_OT_reset_group_interactions)
 
     bpy.utils.unregister_class(ORIGAMI_PT_panel)
     bpy.utils.unregister_class(ORIGAMI_OT_pick_side)
