@@ -2,6 +2,8 @@
 A project I'm working on in Blender to allow you to fold and crease a flat mesh just like you would a piece of paper. Currently it's designed to export to Alembic.
 If anything is ever looking really broken, go to edit mode on the object and hit "fix broken stuff" as a first line of defence.
 
+Video Tutorial: https://www.youtube.com/watch?v=GTniVjGzNZY
+
 --How to use it--
 
 1) How to start:
